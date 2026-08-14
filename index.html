@@ -61,7 +61,7 @@
         players={}, foods=[], powerups=[],
         running=false, paused=false, loopT=null, level=1, tick=0,
         withPowerups=false, roomLabel='';
-    let roomChat=[];
+    let roomChat=[], lobbyFeed=[];
     // Next PU countdown (host only)
     let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
     // Active rooms discovered via MQTT lobby topic
@@ -105,35 +105,34 @@
       modePowerupsBtn.classList.toggle('active',withPowerups);
       if(puLegendEl)puLegendEl.style.display=withPowerups?'block':'none';
     }
-    function chatStoreKey(code){return 'mbfs-neon-snake-chat-'+code;}
     function renderHighscores(){
       const hs=loadHS();
       if(!highscoreEl)return;
       if(!hs.length){highscoreEl.innerHTML='<span class="hs-empty">No scores yet — play a round!</span>';return;}
       highscoreEl.innerHTML=hs.map((e,i)=>`<div class="hs-row"><span class="hs-rank">#${i+1}</span><span class="hs-name">${esc(e.name)}</span><span class="hs-score">${e.score}</span><span class="hs-date">${e.date}</span></div>`).join('');
     }
-    function loadRoomChat(code){
-      try{return JSON.parse(localStorage.getItem(chatStoreKey(code)))||[];}catch{return[];}
-    }
-    function saveRoomChat(code,messages){
-      try{localStorage.setItem(chatStoreKey(code),JSON.stringify(messages.slice(-MAX_CHAT_MESSAGES)));}catch{}
-    }
     function pushRoomChat(entry){
       roomChat=[...roomChat,entry].slice(-MAX_CHAT_MESSAGES);
-      if(roomId)saveRoomChat(roomId,roomChat);
+      renderLobbyChat();
+    }
+    function pushLobbyFeed(entry){
+      lobbyFeed=[...lobbyFeed,entry].slice(-MAX_CHAT_MESSAGES);
       renderLobbyChat();
     }
     function renderLobbyChat(){
       if(!lobbyChatEl||!chatListEl||!chatHintEl)return;
       const inRoom=!!roomId&&roomPanel.classList.contains('show');
-      lobbyChatEl.style.display=inRoom?'flex':'none';
-      chatListEl.innerHTML=roomChat.length
-        ? roomChat.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
+      const visibleMessages=inRoom?roomChat:lobbyFeed;
+      lobbyChatEl.style.display='flex';
+      chatListEl.innerHTML=visibleMessages.length
+        ? visibleMessages.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
         : '<div class="chat-empty">No chat yet.</div>';
       const canWrite=inRoom&&!!myName&&!running;
       chatInput.disabled=!canWrite;
       chatSendBtn.disabled=!canWrite;
-      chatHintEl.textContent=canWrite?'Write a message for this room.':'Read-only until you join this room with a name.';
+      chatHintEl.textContent=inRoom
+        ? (canWrite?'Write a message for this room.':'Read-only until you join this room with a name.')
+        : 'Global live feed from all active rooms.';
       chatListEl.scrollTop=chatListEl.scrollHeight;
     }
     renderHighscores();
@@ -187,6 +186,7 @@
         let changed=false;
         for(const [code,room] of Object.entries(activeRooms)){
           if(now-(room.lastSeen||0)>12000){
+            lobbyFeed=lobbyFeed.filter(entry=>entry.code!==code);
             delete activeRooms[code];
             changed=true;
           }
@@ -324,14 +324,18 @@
       renderHUD();
     }
     function roomChatMessage(msg){
+      const entry={code:msg.roomId,room:msg.roomLabel||roomLabel||roomId,user:msg.user||'Player',text:msg.text||''};
+      pushLobbyFeed(entry);
       if(msg.roomId!==roomId)return;
-      pushRoomChat({room:msg.roomLabel||roomLabel||roomId,user:msg.user||'Player',text:msg.text||''});
+      pushRoomChat(entry);
     }
     function sendRoomChat(){
       const text=(chatInput.value||'').trim();
       if(!text||!roomId||!myName)return;
       const msg={type:'chat',roomId,roomLabel:roomLabel||roomId,user:myName,text:text.slice(0,180)};
-      pushRoomChat({room:msg.roomLabel,user:msg.user,text:msg.text});
+      const entry={code:msg.roomId,room:msg.roomLabel,user:msg.user,text:msg.text};
+      pushLobbyFeed(entry);
+      pushRoomChat(entry);
       relay(msg);
       chatInput.value='';
     }
@@ -618,16 +622,16 @@
 
 <div id="lobby-wrap" class="card">
   <h2>Join or Create a Room</h2>
-  <div class="field">
-    <label for="ni">Your name</label>
-    <input id="ni" type="text" maxlength="16" placeholder="Player" autocomplete="off" />
-  </div>
-
-  <!-- Create options (hidden until create-row is clicked) -->
   <div id="create-options">
-    <div class="field">
-      <label for="room-name-input">Room name</label>
-      <input id="room-name-input" type="text" maxlength="24" placeholder="e.g. Friday Night Snake" autocomplete="off" />
+    <div class="field-row">
+      <div class="field">
+        <label for="ni">Your name</label>
+        <input id="ni" type="text" maxlength="16" placeholder="Player" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="room-name-input">Room name</label>
+        <input id="room-name-input" type="text" maxlength="24" placeholder="e.g. Friday Night Snake" autocomplete="off" />
+      </div>
     </div>
     <div class="field">
       <label>Game mode</label>
@@ -655,8 +659,8 @@
     <div id="active-rooms"></div>
   </div>
 
-  <div id="lobby-chat" class="chat-section" style="display:none">
-    <div class="section-title">💬 Room Chat</div>
+  <div id="lobby-chat" class="chat-section">
+    <div class="section-title">💬 Live Chat</div>
     <div id="chat-list"></div>
     <div id="chat-compose">
       <input id="chat-input" type="text" maxlength="180" placeholder="Write a message…" />
@@ -718,6 +722,7 @@ h1{font-size:1.5rem;font-weight:800;letter-spacing:.1em;text-transform:uppercase
 .card h2{font-size:1rem;font-weight:700;letter-spacing:.06em;}
 .field{display:flex;flex-direction:column;gap:4px;}
 .field label{font-size:.8rem;color:var(--dim);}
+.field-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;}
 input[type=text]{width:100%;padding:9px 11px;background:#1e1e1e;border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:.92rem;outline:none;transition:border-color .15s;}
 input[type=text]:focus{border-color:var(--cyan);}
 .btn{padding:10px 20px;border-radius:4px;font-size:.88rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;cursor:pointer;transition:background .15s,box-shadow .15s,color .15s;border:1.5px solid;background:transparent;width:100%;}
