@@ -39,7 +39,7 @@
   window.addEventListener('DOMContentLoaded',()=>{
     const get=id=>document.getElementById(id);
     const lobbyWrap=get('lobby-wrap'),gameWrap=get('game-wrap'),
-          ni=get('ni'),ji=get('ji'),createBtn=get('create-btn'),soloBtn=get('solo-btn'),
+          ni=get('ni'),ji=get('ji'),createBtn=get('create-btn'),
           joinBtn=get('join-btn'),actionRow=get('action-row'),joinSection=get('join-section'),
           roomPanel=get('room-panel'),roomCode=get('room-code'),copyBtn=get('copy-btn'),
           startBtn=get('start-btn'),startHint=get('start-hint'),playersWrap=get('players-wrap'),
@@ -47,7 +47,7 @@
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
           leaveBtn=get('leave-btn'),connDot=get('conn-dot'),modeLabel=get('mode-label'),
           hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown'),
-          roomNameInput=get('room-name-input'),
+          roomNameInput=get('room-name-input'),puLegendEl=get('pu-legend'),
           modeClassicBtn=get('mode-classic'),modePowerupsBtn=get('mode-powerups'),
           activeRoomsEl=get('active-rooms'),highscoreEl=get('highscore-list');
     const ctx=canvas.getContext('2d');
@@ -99,6 +99,7 @@
       withPowerups=!!powerups;
       modeClassicBtn.classList.toggle('active',!withPowerups);
       modePowerupsBtn.classList.toggle('active',withPowerups);
+      if(puLegendEl)puLegendEl.style.display=withPowerups?'block':'none';
     }
     function renderHighscores(){
       const hs=loadHS();
@@ -210,12 +211,6 @@
       roomId=genCode(); isHost=true;
       players={}; addP(myId,myName,0); setSt('Connecting…','');
       connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();startAnnouncing();});
-    };
-    soloBtn.onclick=()=>{
-      setMode(withPowerups);
-      myName=pickName(ni.value,genPlayerName);
-      ni.value=myName;
-      roomId=genCode();isHost=true;players={};addP(myId,myName,0);enterGame();startGame();modeLabel.textContent='Solo';
     };
     joinBtn.onclick=doJoin;
     ji.addEventListener('keydown',e=>{if(e.key==='Enter')doJoin();});
@@ -601,7 +596,6 @@
   </div>
   <div id="action-row" class="btn-row">
     <button class="btn cyan" id="create-btn">Create Room</button>
-    <button class="btn muted" id="solo-btn">Solo</button>
   </div>
   <div id="join-section">
     <div class="field" style="margin-bottom:8px"><label for="ji">Join existing room</label></div>
@@ -618,7 +612,7 @@
     <div id="active-rooms"></div>
   </div>
 
-  <div class="pu-legend">
+  <div class="pu-legend" id="pu-legend">
     <div class="legend-title">Power-Ups (10s · spawn alle ~13s · weg nach 7s)</div>
     <div class="legend-grid">
       <span><b style="color:#ffe600">⚡</b> Speed Boost</span>
