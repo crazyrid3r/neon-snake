@@ -127,7 +127,7 @@
       const composeEl=document.getElementById('chat-compose');
       if(composeEl)composeEl.style.display=inRoom?'flex':'none';
       chatListEl.innerHTML=visibleMessages.length
-        ? visibleMessages.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
+        ? visibleMessages.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||'Room')}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
         : '<div class="chat-empty">No chat yet.</div>';
       const canWrite=inRoom&&!!myName&&!running;
       chatInput.disabled=!canWrite;
@@ -325,7 +325,7 @@
       renderHUD();
     }
     function roomChatMessage(msg){
-      const entry={code:msg.roomId,room:msg.roomLabel||roomLabel||roomId,user:msg.user||'Player',text:msg.text||''};
+      const entry={code:msg.roomId,room:msg.roomLabel||activeRooms[msg.roomId]?.label||'Room',user:msg.user||'Player',text:msg.text||''};
       pushLobbyFeed(entry);
       if(msg.roomId!==roomId)return;
       pushRoomChat(entry);
@@ -333,7 +333,7 @@
     function sendRoomChat(){
       const text=(chatInput.value||'').trim();
       if(!text||!roomId||!myName)return;
-      const msg={type:'chat',roomId,roomLabel:roomLabel||roomId,user:myName,text:text.slice(0,180)};
+      const msg={type:'chat',roomId,roomLabel:roomLabel||activeRooms[roomId]?.label||'Room',user:myName,text:text.slice(0,180)};
       const entry={code:msg.roomId,room:msg.roomLabel,user:msg.user,text:msg.text};
       pushLobbyFeed(entry);
       pushRoomChat(entry);
@@ -674,7 +674,7 @@
   <div id="lobby-chat" class="chat-section">
     <div class="section-title">💬 Live Chat</div>
     <div id="chat-list"></div>
-    <div id="chat-compose">
+    <div id="chat-compose" style="display:none">
       <input id="chat-input" type="text" maxlength="180" placeholder="Write a message…" />
       <button class="btn muted sm" id="chat-send-btn" type="button">Send</button>
     </div>
