@@ -41,7 +41,7 @@
     const lobbyWrap=get('lobby-wrap'),gameWrap=get('game-wrap'),
           ni=get('ni'),createBtn=get('create-btn'),
           actionRow=get('action-row'),
-          roomPanel=get('room-panel'),
+          roomPanel=get('room-panel'),roomExitBtn=get('room-exit-btn'),
           startBtn=get('start-btn'),startHint=get('start-hint'),playersWrap=get('players-wrap'),
           statusEl=get('status'),canvas=get('c'),overlay=get('overlay'),
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
@@ -49,7 +49,9 @@
           hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown'),
           roomNameInput=get('room-name-input'),puLegendEl=get('pu-legend'),
           modeClassicBtn=get('mode-classic'),modePowerupsBtn=get('mode-powerups'),
-          activeRoomsEl=get('active-rooms'),highscoreEl=get('highscore-list');
+          activeRoomsEl=get('active-rooms'),highscoreEl=get('highscore-list'),
+          lobbyChatEl=get('lobby-chat'),chatListEl=get('chat-list'),chatInput=get('chat-input'),
+          chatSendBtn=get('chat-send-btn'),chatHintEl=get('chat-hint');
     const ctx=canvas.getContext('2d');
     canvas.width=W; canvas.height=H;
 
@@ -59,6 +61,7 @@
         players={}, foods=[], powerups=[],
         running=false, paused=false, loopT=null, level=1, tick=0,
         withPowerups=false, roomLabel='';
+    let roomChat=[];
     // Next PU countdown (host only)
     let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
     // Active rooms discovered via MQTT lobby topic
@@ -91,6 +94,7 @@
     const PLAYER_SUFFIXES=['Rider','Byte','Spark','Dash','Glide','Flux','Wave','Strike','Drift','Pulse'];
     const ROOM_PREFIXES=['Neon','Turbo','Pixel','Ghost','Laser','Nova','Midnight','Hyper','Shadow','Electric'];
     const ROOM_SUFFIXES=['Arena','Pit','Circuit','Grid','Dome','Zone','Room','Run','Club','Battle'];
+    const MAX_CHAT_MESSAGES=24;
     function rnd(arr){return arr[Math.floor(Math.random()*arr.length)];}
     function genPlayerName(){return `${rnd(PLAYER_PREFIXES)} ${rnd(PLAYER_SUFFIXES)}`;}
     function genRoomName(){return `${rnd(ROOM_PREFIXES)} ${rnd(ROOM_SUFFIXES)}`;}
@@ -101,11 +105,36 @@
       modePowerupsBtn.classList.toggle('active',withPowerups);
       if(puLegendEl)puLegendEl.style.display=withPowerups?'block':'none';
     }
+    function chatStoreKey(code){return 'mbfs-neon-snake-chat-'+code;}
     function renderHighscores(){
       const hs=loadHS();
       if(!highscoreEl)return;
       if(!hs.length){highscoreEl.innerHTML='<span class="hs-empty">No scores yet — play a round!</span>';return;}
       highscoreEl.innerHTML=hs.map((e,i)=>`<div class="hs-row"><span class="hs-rank">#${i+1}</span><span class="hs-name">${esc(e.name)}</span><span class="hs-score">${e.score}</span><span class="hs-date">${e.date}</span></div>`).join('');
+    }
+    function loadRoomChat(code){
+      try{return JSON.parse(localStorage.getItem(chatStoreKey(code)))||[];}catch{return[];}
+    }
+    function saveRoomChat(code,messages){
+      try{localStorage.setItem(chatStoreKey(code),JSON.stringify(messages.slice(-MAX_CHAT_MESSAGES)));}catch{}
+    }
+    function pushRoomChat(entry){
+      roomChat=[...roomChat,entry].slice(-MAX_CHAT_MESSAGES);
+      if(roomId)saveRoomChat(roomId,roomChat);
+      renderLobbyChat();
+    }
+    function renderLobbyChat(){
+      if(!lobbyChatEl||!chatListEl||!chatHintEl)return;
+      const inRoom=!!roomId&&roomPanel.classList.contains('show');
+      lobbyChatEl.style.display=inRoom?'flex':'none';
+      chatListEl.innerHTML=roomChat.length
+        ? roomChat.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
+        : '<div class="chat-empty">No chat yet.</div>';
+      const canWrite=inRoom&&!!myName&&!running;
+      chatInput.disabled=!canWrite;
+      chatSendBtn.disabled=!canWrite;
+      chatHintEl.textContent=canWrite?'Write a message for this room.':'Read-only until you join this room with a name.';
+      chatListEl.scrollTop=chatListEl.scrollHeight;
     }
     renderHighscores();
 
@@ -194,6 +223,7 @@
         case 'join':      if(isHost)peerJoined(msg);break;
         case 'join-ack':  if(msg.to===myId)joinedRoom(msg);break;
         case 'roster':    if(!isHost)syncRoster(msg);break;
+        case 'chat':      roomChatMessage(msg);break;
         case 'start':     if(!isHost)remoteStart(msg);break;
         case 'state':     if(!isHost)remoteState(msg);break;
         case 'input':     if(isHost)peerInput(msg);break;
@@ -219,6 +249,8 @@
       code=(code||'').trim().toUpperCase();
       if(code.length<3){setSt('Enter a room code','err');return;}
       myName=pickName(ni.value,genPlayerName); ni.value=myName; roomId=code; isHost=false; setSt('Joining…','');
+      roomChat=loadRoomChat(code);
+      renderLobbyChat();
       connectMQTT(()=>{
         joinRoom(code);
         setTimeout(()=>{
@@ -231,14 +263,29 @@
     modeClassicBtn.onclick=()=>setMode(false);
     modePowerupsBtn.onclick=()=>setMode(true);
     setMode(false);
+    roomExitBtn.onclick=()=>{
+      relay({type:'leave',id:myId});
+      if(mqttClient)mqttClient.end();
+      location.reload();
+    };
+    chatSendBtn.onclick=sendRoomChat;
+    chatInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendRoomChat();}});
     startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType,withPowerups,roomLabel});};
     leaveBtn.onclick=()=>{relay({type:'leave',id:myId});stopAnnouncing();if(mqttClient)mqttClient.end();location.reload();};
 
     function showRoom(hosting){
       roomPanel.classList.add('show');
       actionRow.style.display='none';
-      if(!hosting){startBtn.style.display='none';startHint.textContent='Waiting for host…';}
-      else startHint.textContent='1 player — waiting for friends to join';
+      if(!hosting){
+        startBtn.style.display='none';
+        roomExitBtn.style.display='inline-block';
+        startHint.textContent='Waiting for host…';
+      }else{
+        roomExitBtn.style.display='none';
+        startHint.textContent='1 player — waiting for friends to join';
+      }
+      roomChat=loadRoomChat(roomId);
+      renderLobbyChat();
       setSt('','');
     }
     function renderChips(){
@@ -275,6 +322,18 @@
       if(!players[myId]&&prevMe)addP(myId,prevMe.name,prevMe.pi);
       renderChips();
       renderHUD();
+    }
+    function roomChatMessage(msg){
+      if(msg.roomId!==roomId)return;
+      pushRoomChat({room:msg.roomLabel||roomLabel||roomId,user:msg.user||'Player',text:msg.text||''});
+    }
+    function sendRoomChat(){
+      const text=(chatInput.value||'').trim();
+      if(!text||!roomId||!myName)return;
+      const msg={type:'chat',roomId,roomLabel:roomLabel||roomId,user:myName,text:text.slice(0,180)};
+      pushRoomChat({room:msg.roomLabel,user:msg.user,text:msg.text});
+      relay(msg);
+      chatInput.value='';
     }
     function peerLeft(msg){
       delete players[msg.id];
@@ -582,6 +641,7 @@
   <div id="room-panel">
     <div id="players-wrap"></div>
     <button class="btn cyan" id="start-btn">▶ Start Game</button>
+    <button class="btn muted" id="room-exit-btn" style="display:none">Exit room</button>
     <div id="start-hint">Waiting for players…</div>
   </div>
   <div id="action-row" class="btn-row">
@@ -593,6 +653,16 @@
   <div id="rooms-section" style="display:none">
     <div class="section-title">🟢 Active Rooms</div>
     <div id="active-rooms"></div>
+  </div>
+
+  <div id="lobby-chat" class="chat-section" style="display:none">
+    <div class="section-title">💬 Room Chat</div>
+    <div id="chat-list"></div>
+    <div id="chat-compose">
+      <input id="chat-input" type="text" maxlength="180" placeholder="Write a message…" />
+      <button class="btn muted sm" id="chat-send-btn" type="button">Send</button>
+    </div>
+    <div id="chat-hint"></div>
   </div>
 
   <div class="pu-legend" id="pu-legend">
@@ -718,6 +788,17 @@ canvas{display:block;}
 .room-row .rname{flex:1;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .room-row .rcode{font-family:monospace;font-size:.78rem;color:var(--dim);letter-spacing:.1em;}
 .room-row .rinfo{font-size:.74rem;color:#555;white-space:nowrap;}
+.chat-section{border-top:1px solid var(--border);padding-top:12px;margin-top:-4px;display:flex;flex-direction:column;gap:8px;}
+#chat-list{display:flex;flex-direction:column;gap:5px;max-height:170px;overflow-y:auto;padding:8px;border:1px solid var(--border);border-radius:5px;background:#111;}
+.chat-row{font-size:.78rem;line-height:1.4;color:#aaa;word-break:break-word;}
+.chat-room{color:var(--cyan);font-weight:700;}
+.chat-user{color:#bbb;}
+.chat-msg{color:var(--text);}
+.chat-empty{font-size:.78rem;color:var(--dim);}
+#chat-compose{display:flex;gap:8px;align-items:center;}
+#chat-compose input{flex:1;}
+#chat-compose .btn{width:auto;min-width:68px;}
+#chat-hint{font-size:.74rem;color:var(--dim);}
 /* Highscore */
 .hs-section{border-top:1px solid var(--border);padding-top:12px;margin-top:-4px;}
 #highscore-list{display:flex;flex-direction:column;gap:3px;max-height:180px;overflow-y:auto;}
