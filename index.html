@@ -16,17 +16,23 @@
   ];
   const FCOLS=['#ff2d78','#ffe600','#bf5fff','#ff7b00','#00f5ff','#39ff14'];
 
-  // Power-up definitions
+  // All power-up definitions — duration 10s for all timed effects
   const POWERUPS=[
-    {id:'speed', icon:'⚡',label:'Speed Boost', color:'#ffe600',duration:6000},
-    {id:'shield',icon:'🛡', label:'Shield',      color:'#00f5ff',duration:0},
-    {id:'cut',   icon:'✂', label:'Cut Snake',   color:'#ff2d78',duration:0},
-    {id:'double',icon:'×2',label:'2× Score',    color:'#39ff14',duration:8000},
+    {id:'speed',  icon:'⚡', label:'Speed Boost',  color:'#ffe600', duration:10000},
+    {id:'shield', icon:'🛡', label:'Shield',        color:'#00f5ff', duration:0},      // one-time
+    {id:'cut',    icon:'✂', label:'Cut −3',        color:'#ff2d78', duration:0},      // instant
+    {id:'double', icon:'×2', label:'2× Score',      color:'#39ff14', duration:10000},
+    {id:'magnet', icon:'🧲', label:'Food Magnet',   color:'#bf5fff', duration:10000},
+    {id:'ghost',  icon:'👻', label:'Ghost Mode',    color:'#ffffff', duration:10000},
+    {id:'swap',   icon:'🔀', label:'Position Swap', color:'#ff7b00', duration:0},      // instant
   ];
-  const PU_CHANCE=0.18;
+  const PU_DESPAWN=7000;  // 7s on field
+  const PU_CHANCE=0.22;
+  // Next power-up countdown: scheduled every 8-18s
+  const PU_MIN_INTERVAL=8000, PU_MAX_INTERVAL=18000;
 
   const MQTT_BROKER ='wss://broker.hivemq.com:8884/mqtt';
-  const TOPIC_PREFIX='mbfs-snake-v1/';
+  const TOPIC_PREFIX='mbfs-snake-v2/';
 
   window.addEventListener('DOMContentLoaded',()=>{
     const get=id=>document.getElementById(id);
@@ -38,15 +44,17 @@
           statusEl=get('status'),canvas=get('c'),overlay=get('overlay'),
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
           leaveBtn=get('leave-btn'),connDot=get('conn-dot'),modeLabel=get('mode-label'),
-          hudEl=get('hud'),dpadEl=get('dpad');
+          hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown');
     const ctx=canvas.getContext('2d');
     canvas.width=W; canvas.height=H;
 
     // State
-    let mqttClient=null,myId='p'+Math.random().toString(36).slice(2,8),
-        myName='',roomId='',topic='',isHost=false,
-        players={},foods=[],powerups=[],
-        running=false,paused=false,loopT=null,level=1,tick=0;
+    let mqttClient=null, myId='p'+Math.random().toString(36).slice(2,8),
+        myName='', roomId='', topic='', isHost=false,
+        players={}, foods=[], powerups=[],
+        running=false, paused=false, loopT=null, level=1, tick=0;
+    // Next PU countdown (host only)
+    let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
 
     function me(){return players[myId];}
     function genCode(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';return Array.from({length:5},()=>c[Math.floor(Math.random()*c.length)]).join('');}
@@ -70,19 +78,19 @@
     // Messages
     function handle(msg){
       switch(msg.type){
-        case 'join':     if(isHost)peerJoined(msg);break;
-        case 'join-ack': if(msg.to===myId)joinedRoom(msg);break;
-        case 'start':    if(!isHost)remoteStart(msg);break;
-        case 'state':    if(!isHost)remoteState(msg);break;
-        case 'input':    if(isHost)peerInput(msg);break;
-        case 'leave':    peerLeft(msg);break;
+        case 'join':      if(isHost)peerJoined(msg);break;
+        case 'join-ack':  if(msg.to===myId)joinedRoom(msg);break;
+        case 'start':     if(!isHost)remoteStart(msg);break;
+        case 'state':     if(!isHost)remoteState(msg);break;
+        case 'input':     if(isHost)peerInput(msg);break;
+        case 'leave':     peerLeft(msg);break;
       }
     }
 
     // Lobby
     createBtn.onclick=()=>{
-      myName=ni.value.trim()||'Player';roomId=genCode();isHost=true;
-      players={};addP(myId,myName,0);setSt('Connecting…','');
+      myName=ni.value.trim()||'Player'; roomId=genCode(); isHost=true;
+      players={}; addP(myId,myName,0); setSt('Connecting…','');
       connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();});
     };
     soloBtn.onclick=()=>{myName=ni.value.trim()||'Player';roomId=genCode();isHost=true;players={};addP(myId,myName,0);enterGame();startGame();modeLabel.textContent='Solo';};
@@ -94,7 +102,7 @@
     function doJoin(){
       const code=ji.value.trim().toUpperCase();
       if(code.length<3){setSt('Enter a room code','err');return;}
-      myName=ni.value.trim()||'Player';roomId=code;isHost=false;setSt('Joining…','');
+      myName=ni.value.trim()||'Player'; roomId=code; isHost=false; setSt('Joining…','');
       connectMQTT(()=>{
         joinRoom(code);
         setTimeout(()=>{
@@ -106,10 +114,11 @@
     copyBtn.onclick=()=>{
       const link=location.href.split('?')[0]+'?join='+roomId;
       try{navigator.clipboard.writeText(link);}catch(e){}
-      const t=document.createElement('input');t.value=link;document.body.appendChild(t);t.select();try{document.execCommand('copy');}catch(e){}document.body.removeChild(t);
+      const t=document.createElement('input');t.value=link;document.body.appendChild(t);t.select();
+      try{document.execCommand('copy');}catch(e){}document.body.removeChild(t);
       copyBtn.textContent='Copied!';setTimeout(()=>copyBtn.textContent='Copy link',1500);
     };
-    startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups});};
+    startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType});};
     leaveBtn.onclick=()=>{relay({type:'leave',id:myId});if(mqttClient)mqttClient.end();location.reload();};
 
     function showRoom(hosting){
@@ -121,7 +130,11 @@
     }
     function renderChips(){
       playersWrap.innerHTML='';
-      for(const p of Object.values(players)){const pal=PAL[p.pi%PAL.length];const d=document.createElement('div');d.className='chip';d.style.cssText=`border-color:${pal.h};color:${pal.h};text-shadow:0 0 8px ${pal.h}44`;d.textContent=p.name+(p.id===myId?' ★':'');playersWrap.appendChild(d);}
+      for(const p of Object.values(players)){
+        const pal=PAL[p.pi%PAL.length];const d=document.createElement('div');d.className='chip';
+        d.style.cssText=`border-color:${pal.h};color:${pal.h};text-shadow:0 0 8px ${pal.h}44`;
+        d.textContent=p.name+(p.id===myId?' ★':'');playersWrap.appendChild(d);
+      }
     }
 
     // Peer messages
@@ -129,17 +142,29 @@
     function joinedRoom(msg){players={};for(const p of msg.peers)addP(p.id,p.name,p.pi);if(!players[myId])addP(myId,myName,Object.keys(players).length%PAL.length);showRoom(false);renderChips();setSt('Joined!','ok');setTimeout(()=>setSt('',''),2000);}
     function peerInput(msg){const p=players[msg.id];if(p&&p.alive)p.nd=msg.dir;}
     function peerLeft(msg){delete players[msg.id];renderChips();renderHUD();}
-    function remoteStart(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];enterGame();renderGame();renderHUD();overlay.classList.add('hide');running=true;}
-    function remoteState(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];level=msg.level;renderGame();renderHUD();if(msg.over)showOver(false);}
+    function remoteStart(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt||0;nextPUType=msg.nextPUType||null;enterGame();renderGame();renderHUD();overlay.classList.add('hide');running=true;}
+    function remoteState(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt;nextPUType=msg.nextPUType;level=msg.level;renderGame();renderHUD();updateCountdown();if(msg.over)showOver(false);}
 
     // Players
     function addP(id,name,pi){players[id]={id,name,pi:pi%PAL.length,snake:[],dir:{x:1,y:0},nd:{x:1,y:0},alive:true,score:0,effects:{}};}
     function ser(){return Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi,snake:p.snake,dir:p.dir,nd:p.nd,alive:p.alive,score:p.score,effects:p.effects}));}
     function restorePl(list){for(const p of list){if(!players[p.id])players[p.id]={};Object.assign(players[p.id],p);}}
 
-    // Power-ups
-    function trySpawnPU(){
-      if(Math.random()>PU_CHANCE)return;
+    // ── Power-up countdown (host schedules, broadcasts timing) ──
+    function scheduleNextPU(){
+      const delay=PU_MIN_INTERVAL+Math.random()*(PU_MAX_INTERVAL-PU_MIN_INTERVAL);
+      const def=POWERUPS[Math.floor(Math.random()*POWERUPS.length)];
+      nextPUAt=Date.now()+delay;
+      nextPUType=def.id;
+      clearTimeout(puCountdownTimer);
+      puCountdownTimer=setTimeout(()=>{
+        if(!running)return;
+        spawnScheduledPU(def);
+        scheduleNextPU(); // schedule next
+      },delay);
+    }
+
+    function spawnScheduledPU(def){
       const occ=new Set();
       for(const p of Object.values(players))for(const s of p.snake)occ.add(s.x+','+s.y);
       for(const f of foods)occ.add(f.x+','+f.y);
@@ -148,24 +173,50 @@
       while(tries++<200){
         const x=Math.floor(Math.random()*COLS),y=Math.floor(Math.random()*ROWS);
         if(!occ.has(x+','+y)){
-          const def=POWERUPS[Math.floor(Math.random()*POWERUPS.length)];
           const uid='pu'+Math.random().toString(36).slice(2,8);
-          powerups.push({x,y,type:def.id,id:uid});
-          // Auto-despawn after 12s
-          setTimeout(()=>{powerups=powerups.filter(u=>u.id!==uid);},12000);
+          const pu={x,y,type:def.id,id:uid,spawnedAt:Date.now()};
+          powerups.push(pu);
+          // Auto-despawn after 7s
+          setTimeout(()=>{powerups=powerups.filter(u=>u.id!==uid);},PU_DESPAWN);
           return;
         }
       }
     }
+
+    function updateCountdown(){
+      if(!puCountdownEl)return;
+      if(!running||!nextPUAt||!nextPUType){puCountdownEl.style.display='none';return;}
+      const def=POWERUPS.find(p=>p.id===nextPUType);
+      const rem=Math.max(0,Math.ceil((nextPUAt-Date.now())/1000));
+      if(rem<=0){puCountdownEl.style.display='none';return;}
+      puCountdownEl.style.display='flex';
+      puCountdownEl.innerHTML=`<span style="color:${def?def.color:'#aaa'}">${def?def.icon:'?'}</span> <span class="cd-label">${def?def.label:'?'}</span> <span class="cd-timer">${rem}s</span>`;
+    }
+
     function applyPU(player,puType){
       const def=POWERUPS.find(p=>p.id===puType);if(!def)return;
       showPUBanner(player,def);
       const now=Date.now();
-      if(puType==='speed')   player.effects.speed=now+def.duration;
-      if(puType==='shield')  player.effects.shield=true;
-      if(puType==='cut')     {if(player.snake.length>3)player.snake=player.snake.slice(0,Math.ceil(player.snake.length/2));}
-      if(puType==='double')  player.effects.double=now+def.duration;
+      switch(puType){
+        case 'speed':  player.effects.speed=now+def.duration; break;
+        case 'shield': player.effects.shield=true; break;
+        case 'cut':    if(player.snake.length>4)player.snake=player.snake.slice(0,player.snake.length-3); break;
+        case 'double': player.effects.double=now+def.duration; break;
+        case 'magnet': player.effects.magnet=now+def.duration; break;
+        case 'ghost':  player.effects.ghost=now+def.duration; break;
+        case 'swap': {
+          const others=Object.values(players).filter(op=>op.id!==player.id&&op.alive&&op.snake.length>0);
+          if(others.length>0){
+            const target=others[Math.floor(Math.random()*others.length)];
+            const tmpHead={...player.snake[0]};
+            player.snake[0]={...target.snake[0]};
+            target.snake[0]=tmpHead;
+          }
+          break;
+        }
+      }
     }
+
     function showPUBanner(player,def){
       const b=document.createElement('div');b.className='pu-banner';
       b.style.cssText=`color:${def.color};border-color:${def.color};box-shadow:0 0 12px ${def.color}55`;
@@ -190,12 +241,21 @@
       for(const f of foods)occ.add(f.x+','+f.y);
       for(const u of powerups)occ.add(u.x+','+u.y);
       let added=0,tries=0;
-      while(added<n&&tries<500){tries++;const pos={x:Math.floor(Math.random()*COLS),y:Math.floor(Math.random()*ROWS)};if(!occ.has(pos.x+','+pos.y)){pos.color=FCOLS[Math.floor(Math.random()*FCOLS.length)];foods.push(pos);occ.add(pos.x+','+pos.y);added++;}}
+      while(added<n&&tries<500){tries++;
+        const pos={x:Math.floor(Math.random()*COLS),y:Math.floor(Math.random()*ROWS)};
+        if(!occ.has(pos.x+','+pos.y)){pos.color=FCOLS[Math.floor(Math.random()*FCOLS.length)];foods.push(pos);occ.add(pos.x+','+pos.y);added++;}
+      }
     }
+
     function startGame(){
       foods=[];powerups=[];initSnakes();placeFood(Math.max(1,Object.keys(players).length));
-      level=1;tick=0;running=true;paused=false;overlay.classList.add('hide');renderHUD();sched();
+      level=1;tick=0;running=true;paused=false;overlay.classList.add('hide');renderHUD();
+      if(isHost)scheduleNextPU();
+      sched();
+      // Start countdown UI updater
+      setInterval(updateCountdown,500);
     }
+
     function baseIv(){return Math.max(60,200-(level-1)*8);}
     function sched(){clearTimeout(loopT);if(!running||paused||!isHost)return;const p=me();const sp=p&&p.effects&&p.effects.speed&&Date.now()<p.effects.speed;loopT=setTimeout(step,sp?Math.floor(baseIv()*0.5):baseIv());}
 
@@ -204,27 +264,45 @@
       const now=Date.now();
       for(const p of Object.values(players)){
         if(!p.alive)continue;
+        // Expire effects
         if(p.effects.speed&&now>p.effects.speed)delete p.effects.speed;
         if(p.effects.double&&now>p.effects.double)delete p.effects.double;
+        if(p.effects.magnet&&now>p.effects.magnet)delete p.effects.magnet;
+        if(p.effects.ghost&&now>p.effects.ghost)delete p.effects.ghost;
         p.dir=p.nd;
-        const h={x:p.snake[0].x+p.dir.x,y:p.snake[0].y+p.dir.y};
-        if(h.x<0||h.x>=COLS||h.y<0||h.y>=ROWS||p.snake.some(s=>s.x===h.x&&s.y===h.y)||Object.values(players).some(op=>op.id!==p.id&&op.snake.some(s=>s.x===h.x&&s.y===h.y))){
+        let nx=p.snake[0].x+p.dir.x, ny=p.snake[0].y+p.dir.y;
+        // Magnet: redirect towards nearest food
+        if(p.effects.magnet&&now<p.effects.magnet&&foods.length>0){
+          let best=null,bd=Infinity;
+          for(const f of foods){const d=Math.abs(f.x-p.snake[0].x)+Math.abs(f.y-p.snake[0].y);if(d<bd){bd=d;best=f;}}
+          if(best&&bd<=3){
+            const dx=Math.sign(best.x-p.snake[0].x),dy=Math.sign(best.y-p.snake[0].y);
+            if(dx!==0&&!(dx===-p.dir.x&&dy===0)){nx=p.snake[0].x+dx;ny=p.snake[0].y;}
+            else if(dy!==0&&!(dy===-p.dir.y&&dx===0)){nx=p.snake[0].x;ny=p.snake[0].y+dy;}
+          }
+        }
+        const h={x:nx,y:ny};
+        const wallHit=h.x<0||h.x>=COLS||h.y<0||h.y>=ROWS;
+        const ghostOn=p.effects.ghost&&now<p.effects.ghost;
+        const selfHit=!ghostOn&&p.snake.some(s=>s.x===h.x&&s.y===h.y);
+        const otherHit=!ghostOn&&Object.values(players).some(op=>op.id!==p.id&&op.snake.some(s=>s.x===h.x&&s.y===h.y));
+        if(wallHit||selfHit||otherHit){
           if(p.effects.shield){delete p.effects.shield;continue;}
           p.alive=false;continue;
         }
         p.snake.unshift(h);
         const fi=foods.findIndex(f=>f.x===h.x&&f.y===h.y);
-        if(fi!==-1){const pts=p.effects.double&&now<p.effects.double?2:1;p.score+=pts;foods.splice(fi,1);placeFood(1);trySpawnPU();}
+        if(fi!==-1){const pts=p.effects.double&&now<p.effects.double?2:1;p.score+=pts;foods.splice(fi,1);placeFood(1);}
         else p.snake.pop();
         const pi=powerups.findIndex(u=>u.x===h.x&&u.y===h.y);
         if(pi!==-1){applyPU(p,powerups[pi].type);powerups.splice(pi,1);}
       }
-      renderGame();renderHUD();
+      renderGame();renderHUD();updateCountdown();
       const alive=Object.values(players).filter(p=>p.alive);
       const total=Object.keys(players).length;
       const over=total>1?alive.length<=1:alive.length===0;
-      relay({type:'state',players:ser(),foods,powerups,level,tick,over});
-      if(over){running=false;showOver(true);}else sched();
+      relay({type:'state',players:ser(),foods,powerups,level,tick,over,nextPUAt,nextPUType});
+      if(over){running=false;clearTimeout(puCountdownTimer);showOver(true);}else sched();
     }
 
     // HUD
@@ -239,6 +317,8 @@
         if(p.effects.speed&&now<p.effects.speed)badges+='<span class="badge" style="background:#ffe60033;color:#ffe600">⚡</span>';
         if(p.effects.shield)badges+='<span class="badge" style="background:#00f5ff33;color:#00f5ff">🛡</span>';
         if(p.effects.double&&now<p.effects.double)badges+='<span class="badge" style="background:#39ff1433;color:#39ff14">×2</span>';
+        if(p.effects.magnet&&now<p.effects.magnet)badges+='<span class="badge" style="background:#bf5fff33;color:#bf5fff">🧲</span>';
+        if(p.effects.ghost&&now<p.effects.ghost)badges+='<span class="badge" style="background:#ffffff22;color:#ddd">👻</span>';
         d.innerHTML=`<div class="hname" style="color:${pal.h}">${esc(p.name)} ${badges}</div><div class="hscore" style="color:${pal.h};text-shadow:0 0 8px ${pal.h}66">${p.score}</div>`;
         hudEl.appendChild(d);
       }
@@ -257,41 +337,30 @@
       if(!isHost)return;
       initSnakes();foods=[];powerups=[];placeFood(Math.max(1,Object.keys(players).length));
       level=1;tick=0;running=true;overlay.classList.add('hide');renderHUD();
-      relay({type:'start',players:ser(),foods,powerups});sched();
+      scheduleNextPU();
+      relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType});sched();
     };
 
     // Input
     const DIRS={ArrowUp:{x:0,y:-1},w:{x:0,y:-1},W:{x:0,y:-1},ArrowDown:{x:0,y:1},s:{x:0,y:1},S:{x:0,y:1},ArrowLeft:{x:-1,y:0},a:{x:-1,y:0},A:{x:-1,y:0},ArrowRight:{x:1,y:0},d:{x:1,y:0},D:{x:1,y:0}};
-    document.addEventListener('keydown',e=>{
-      const d=DIRS[e.key];if(d){e.preventDefault();pushDir(d);return;}
-      if(e.key==='p'||e.key==='P'){if(!running)return;paused=!paused;if(!paused&&isHost)sched();}
-    });
+    document.addEventListener('keydown',e=>{const d=DIRS[e.key];if(d){e.preventDefault();pushDir(d);return;}if(e.key==='p'||e.key==='P'){if(!running)return;paused=!paused;if(!paused&&isHost)sched();}});
     function pushDir(d){const p=me();if(!p||!p.alive)return;if(d.x===-p.dir.x&&d.y===-p.dir.y)return;p.nd=d;if(!isHost)relay({type:'input',id:myId,dir:d});}
 
     // D-Pad
     function makeDpadBtn(label,dir,area){
-      const btn=document.createElement('button');
-      btn.className='dpad-btn';btn.textContent=label;btn.dataset.area=area;
+      const btn=document.createElement('button');btn.className='dpad-btn';btn.textContent=label;btn.dataset.area=area;
       const go=e=>{e.preventDefault();pushDir(dir);};
-      btn.addEventListener('touchstart',go,{passive:false});
-      btn.addEventListener('mousedown',go);
-      return btn;
+      btn.addEventListener('touchstart',go,{passive:false});btn.addEventListener('mousedown',go);return btn;
     }
     dpadEl.appendChild(makeDpadBtn('▲',{x:0,y:-1},'up'));
     dpadEl.appendChild(makeDpadBtn('◀',{x:-1,y:0},'left'));
     dpadEl.appendChild(makeDpadBtn('▼',{x:0,y:1},'down'));
     dpadEl.appendChild(makeDpadBtn('▶',{x:1,y:0},'right'));
 
-    // Swipe fallback
+    // Swipe
     let ts=null;
     canvas.addEventListener('touchstart',e=>{ts=e.touches[0];},{passive:true});
-    canvas.addEventListener('touchend',e=>{
-      if(!ts)return;
-      const dx=e.changedTouches[0].clientX-ts.clientX,dy=e.changedTouches[0].clientY-ts.clientY;
-      if(Math.abs(dx)<20&&Math.abs(dy)<20){ts=null;return;}
-      pushDir(Math.abs(dx)>Math.abs(dy)?(dx>0?DIRS.ArrowRight:DIRS.ArrowLeft):(dy>0?DIRS.ArrowDown:DIRS.ArrowUp));
-      ts=null;
-    },{passive:true});
+    canvas.addEventListener('touchend',e=>{if(!ts)return;const dx=e.changedTouches[0].clientX-ts.clientX,dy=e.changedTouches[0].clientY-ts.clientY;if(Math.abs(dx)<20&&Math.abs(dy)<20){ts=null;return;}pushDir(Math.abs(dx)>Math.abs(dy)?(dx>0?DIRS.ArrowRight:DIRS.ArrowLeft):(dy>0?DIRS.ArrowDown:DIRS.ArrowUp));ts=null;},{passive:true});
 
     // Render
     function renderGame(){
@@ -301,26 +370,35 @@
       for(let y=0;y<=ROWS;y++){ctx.beginPath();ctx.moveTo(0,y*CELL);ctx.lineTo(W,y*CELL);ctx.stroke();}
       for(const f of foods)drawFood(f);
       for(const u of powerups)drawPU(u);
+      const now=Date.now();
       for(const p of Object.values(players).sort((a,b)=>a.alive-b.alive)){
         if(!p.snake.length)continue;
         const pal=PAL[p.pi%PAL.length],base=p.alive?1:.2;
-        const glow=p.effects.speed&&Date.now()<p.effects.speed?12:5;
-        for(let i=p.snake.length-1;i>=1;i--)drawCell(p.snake[i].x,p.snake[i].y,pal.b,base*(0.5+0.5*(1-i/p.snake.length)),2);
-        drawCell(p.snake[0].x,p.snake[0].y,pal.h,base,glow);
+        const ghostOn=p.effects.ghost&&now<p.effects.ghost;
+        const glow=p.effects.speed&&now<p.effects.speed?12:5;
+        const alpha=ghostOn?0.4:base;
+        for(let i=p.snake.length-1;i>=1;i--)drawCell(p.snake[i].x,p.snake[i].y,pal.b,alpha*(0.5+0.5*(1-i/p.snake.length)),2);
+        drawCell(p.snake[0].x,p.snake[0].y,ghostOn?'#ffffff':pal.h,alpha,glow);
         if(p.effects.shield){ctx.save();ctx.strokeStyle='#00f5ff';ctx.lineWidth=2;ctx.globalAlpha=0.7;ctx.shadowColor='#00f5ff';ctx.shadowBlur=10;ctx.beginPath();ctx.arc(p.snake[0].x*CELL+CELL/2,p.snake[0].y*CELL+CELL/2,CELL/2+2,0,Math.PI*2);ctx.stroke();ctx.restore();}
+        if(ghostOn){ctx.save();ctx.strokeStyle='#ffffff';ctx.lineWidth=1;ctx.globalAlpha=0.3;ctx.setLineDash([3,3]);ctx.beginPath();ctx.arc(p.snake[0].x*CELL+CELL/2,p.snake[0].y*CELL+CELL/2,CELL/2+1,0,Math.PI*2);ctx.stroke();ctx.setLineDash([]);ctx.restore();}
       }
     }
     function drawCell(x,y,col,alpha,glow){ctx.save();ctx.globalAlpha=alpha;ctx.shadowColor=col;ctx.shadowBlur=glow*3;ctx.fillStyle=col;ctx.beginPath();ctx.roundRect(x*CELL+1,y*CELL+1,CELL-2,CELL-2,3);ctx.fill();ctx.restore();}
     function drawFood(f){const px=f.x*CELL+CELL/2,py=f.y*CELL+CELL/2,r=(CELL-6)/2;ctx.save();ctx.shadowColor=f.color;ctx.shadowBlur=18;ctx.fillStyle=f.color;ctx.beginPath();ctx.arc(px,py,r,0,Math.PI*2);ctx.fill();const g=ctx.createRadialGradient(px-r*.3,py-r*.3,1,px,py,r);g.addColorStop(0,'rgba(255,255,255,.5)');g.addColorStop(1,'rgba(255,255,255,0)');ctx.fillStyle=g;ctx.fill();ctx.restore();}
     function drawPU(u){
       const def=POWERUPS.find(p=>p.id===u.type);if(!def)return;
+      // Despawn fade: last 2s fade out
+      const age=u.spawnedAt?Date.now()-u.spawnedAt:0;
+      const fadeStart=PU_DESPAWN-2000;
+      const fadeAlpha=age>fadeStart?Math.max(0,1-(age-fadeStart)/2000):1;
       const pulse=0.7+0.3*Math.sin(Date.now()/300);
-      ctx.save();ctx.strokeStyle=def.color;ctx.lineWidth=2;ctx.globalAlpha=pulse;ctx.shadowColor=def.color;ctx.shadowBlur=14;
+      ctx.save();ctx.strokeStyle=def.color;ctx.lineWidth=2;ctx.globalAlpha=pulse*fadeAlpha;ctx.shadowColor=def.color;ctx.shadowBlur=14;
       ctx.beginPath();ctx.roundRect(u.x*CELL+1,u.y*CELL+1,CELL-2,CELL-2,5);ctx.stroke();
-      ctx.globalAlpha=0.12;ctx.fillStyle=def.color;ctx.beginPath();ctx.roundRect(u.x*CELL+1,u.y*CELL+1,CELL-2,CELL-2,5);ctx.fill();ctx.restore();
-      ctx.save();ctx.globalAlpha=1;ctx.font='bold 11px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=def.color;ctx.shadowColor=def.color;ctx.shadowBlur=8;ctx.fillText(def.icon,u.x*CELL+CELL/2,u.y*CELL+CELL/2);ctx.restore();
+      ctx.globalAlpha=0.12*fadeAlpha;ctx.fillStyle=def.color;ctx.beginPath();ctx.roundRect(u.x*CELL+1,u.y*CELL+1,CELL-2,CELL-2,5);ctx.fill();ctx.restore();
+      ctx.save();ctx.globalAlpha=fadeAlpha;ctx.font='bold 11px sans-serif';ctx.textAlign='center';ctx.textBaseline='middle';ctx.fillStyle=def.color;ctx.shadowColor=def.color;ctx.shadowBlur=8;ctx.fillText(def.icon,u.x*CELL+CELL/2,u.y*CELL+CELL/2);ctx.restore();
     }
 
+    // Initial canvas
     (()=>{ctx.fillStyle='#0d0d0d';ctx.fillRect(0,0,W,H);ctx.strokeStyle='rgba(255,255,255,0.033)';ctx.lineWidth=1;for(let x=0;x<=COLS;x++){ctx.beginPath();ctx.moveTo(x*CELL,0);ctx.lineTo(x*CELL,H);ctx.stroke();}for(let y=0;y<=ROWS;y++){ctx.beginPath();ctx.moveTo(0,y*CELL);ctx.lineTo(W,y*CELL);ctx.stroke();}})();
 
     connectMQTT(null);
@@ -357,18 +435,22 @@
   </div>
   <div id="status"></div>
   <div class="pu-legend">
-    <div class="legend-title">Power-Ups</div>
+    <div class="legend-title">Power-Ups (10s · spawn alle ~13s · weg nach 7s)</div>
     <div class="legend-grid">
       <span><b style="color:#ffe600">⚡</b> Speed Boost</span>
-      <span><b style="color:#00f5ff">🛡</b> Shield</span>
-      <span><b style="color:#ff2d78">✂</b> Cut Snake</span>
+      <span><b style="color:#00f5ff">🛡</b> Shield (1×)</span>
+      <span><b style="color:#ff2d78">✂</b> Cut −3 Segmente</span>
       <span><b style="color:#39ff14">×2</b> 2× Score</span>
+      <span><b style="color:#bf5fff">🧲</b> Food Magnet</span>
+      <span><b style="color:#fff">👻</b> Ghost Mode</span>
+      <span><b style="color:#ff7b00">🔀</b> Pos. Swap</span>
     </div>
   </div>
 </div>
 
 <div id="game-wrap">
   <div id="hud"></div>
+  <div id="pu-countdown"></div>
   <div id="canvas-wrap">
     <canvas id="c"></canvas>
     <div id="overlay">
@@ -425,8 +507,8 @@ input[type=text]:focus{border-color:var(--cyan);}
 #join-row input{flex:1;}
 #join-row .btn{width:auto;padding:9px 16px;}
 .pu-legend{border-top:1px solid var(--border);padding-top:12px;margin-top:-4px;}
-.legend-title{font-size:.72rem;color:var(--dim);margin-bottom:6px;letter-spacing:.06em;text-transform:uppercase;}
-.legend-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:.8rem;color:#888;}
+.legend-title{font-size:.72rem;color:var(--dim);margin-bottom:6px;letter-spacing:.05em;}
+.legend-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:.79rem;color:#888;}
 .legend-grid span{display:flex;align-items:center;gap:5px;}
 #game-wrap{display:none;flex-direction:column;align-items:center;}
 #game-wrap.show{display:flex;}
@@ -438,6 +520,10 @@ input[type=text]:focus{border-color:var(--cyan);}
 .hp.dead .hname,.hp.dead .hscore{opacity:.28;text-decoration:line-through;}
 .hp.me .hname::after{content:' ★';font-weight:400;opacity:.4;font-size:.68rem;}
 .badge{font-size:.65rem;padding:1px 4px;border-radius:3px;line-height:1.4;}
+/* Power-up countdown bar */
+#pu-countdown{display:none;align-items:center;gap:8px;font-size:.8rem;color:#aaa;background:var(--surface);border:1px solid var(--border);border-top:none;padding:5px 12px;width:100%;justify-content:center;}
+#pu-countdown .cd-label{color:#bbb;letter-spacing:.04em;}
+#pu-countdown .cd-timer{font-family:monospace;font-weight:700;font-size:.9rem;color:var(--cyan);min-width:2.5ch;text-align:right;}
 #canvas-wrap{position:relative;border:1px solid var(--border);border-radius:0 0 6px 6px;overflow:hidden;box-shadow:0 0 50px rgba(0,245,255,.07);}
 canvas{display:block;}
 #overlay{position:absolute;inset:0;background:rgba(13,13,13,.9);backdrop-filter:blur(3px);display:flex;flex-direction:column;align-items:center;justify-content:center;gap:16px;}
@@ -458,7 +544,6 @@ canvas{display:block;}
 .dpad-btn[data-area=right]{grid-area:right;}
 #ctrl{margin-top:8px;display:flex;gap:8px;align-items:center;font-size:.78rem;color:var(--dim);flex-wrap:wrap;justify-content:center;}
 .key{display:inline-block;padding:2px 6px;border:1px solid var(--border);border-radius:3px;font-size:.74rem;color:#aaa;background:var(--surface);}
-/* Power-up banner */
 .pu-banner{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-60px);background:#111;border:1.5px solid;border-radius:8px;padding:8px 20px;font-size:.9rem;font-weight:700;letter-spacing:.04em;z-index:100;opacity:0;transition:transform .3s,opacity .3s;white-space:nowrap;pointer-events:none;}
 .pu-banner.show{opacity:1;transform:translateX(-50%) translateY(0);}
 </style>
