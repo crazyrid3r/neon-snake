@@ -4,14 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neon Snake — Multiplayer</title>
+  <!-- mqtt.js for MQTT-over-WebSocket transport (no own server needed) -->
+  <script src="https://unpkg.com/mqtt@4/dist/mqtt.min.js"></script>
   <script>
-  /* ══════════════════════════════════════════════════════════════
-     NEON SNAKE — WebSocket Multiplayer
-     · No CDN, no dependencies — pure browser JS
-     · Transport: WebSocket to server.js relay
-     · Server URL: ?server=HOST:PORT  (default localhost:3000)
-     · One tab is HOST (runs game loop), others send only input
-     ══════════════════════════════════════════════════════════════ */
   'use strict';
 
   const CELL=20, COLS=25, ROWS=22, W=COLS*CELL, H=ROWS*CELL;
@@ -22,21 +17,10 @@
   ];
   const FCOLS=['#ff2d78','#ffe600','#bf5fff','#ff7b00','#00f5ff','#39ff14'];
 
-  // ── Server URL resolution ─────────────────────────────────────
-  // Priority: ?server= param > localStorage > auto-detect
-  const RENDER_HOST = 'neon-snake-server.onrender.com'; // updated after Render deploy
-  function getServerURL() {
-    const p = new URLSearchParams(location.search).get('server');
-    if (p) return p.includes('://') ? p : 'ws://'+p;
-    const stored = localStorage.getItem('ns_server');
-    if (stored) return stored;
-    // If served from HTTPS (GitHub Pages) → use Render server
-    if (location.protocol === 'https:') return 'wss://'+RENDER_HOST;
-    // Local/HTTP → use localhost
-    return 'ws://localhost:3000';
-  }
-
-  let WS_URL = getServerURL();
+  // ── MQTT config ───────────────────────────────────────────────
+  // Public HiveMQ broker — no account needed, works everywhere
+  const MQTT_BROKER = 'wss://broker.hivemq.com:8884/mqtt';
+  const TOPIC_PREFIX = 'neon-snake-v2/';   // room topic = TOPIC_PREFIX+roomId
 
   window.addEventListener('DOMContentLoaded', () => {
     const get = id => document.getElementById(id);
@@ -66,30 +50,16 @@
     const leaveBtn    = get('leave-btn');
     const connDot     = get('conn-dot');
     const modeLabel   = get('mode-label');
-    const serverInput = get('server-input');
-    const serverApply = get('server-apply');
-    const serverRow   = get('server-row');
     const hudEl       = get('hud');
 
     canvas.width=W; canvas.height=H;
 
-    // Show current server URL
-    serverInput.value = WS_URL.replace('ws://','').replace('wss://','');
-
-    serverApply.onclick = () => {
-      let v = serverInput.value.trim();
-      if (!v) return;
-      if (!v.startsWith('ws://') && !v.startsWith('wss://')) v = 'ws://'+v;
-      WS_URL = v;
-      localStorage.setItem('ns_server', v);
-      connectWS();
-    };
-
-    // ── State ────────────────────────────────────────────────────
-    let ws = null;
+    // ── State ─────────────────────────────────────────────────────
+    let mqttClient = null;
     let myId   = 'p'+Math.random().toString(36).slice(2,8);
     let myName = '';
     let roomId = '';
+    let topic  = '';
     let isHost = false;
     let players = {};
     let foods   = [];
@@ -104,75 +74,72 @@
     function setSt(msg,cls){ statusEl.textContent=msg; statusEl.className=cls||''; }
     function esc(s){ return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-    // ── WebSocket ────────────────────────────────────────────────
-    function connectWS() {
-      if (ws && ws.readyState < 2) { ws.close(); }
-      setSt('Connecting to '+WS_URL+'…','');
+    // ── MQTT Transport ────────────────────────────────────────────
+    function connectMQTT(onReady) {
+      setSt('Connecting to relay…','');
       connDot.className = '';
-      try {
-        ws = new WebSocket(WS_URL);
-      } catch(e) {
-        setSt('Invalid server URL','err'); connDot.className='err'; return;
-      }
 
-      ws.onopen = () => {
+      const clientId = 'nsnake-' + Math.random().toString(36).slice(2,10);
+      mqttClient = mqtt.connect(MQTT_BROKER, {
+        clientId,
+        keepalive: 30,
+        reconnectPeriod: 2000,
+        connectTimeout: 8000,
+      });
+
+      mqttClient.on('connect', () => {
         connDot.className = 'on';
-        modeLabel.textContent = 'Connected ✓';
+        modeLabel.textContent = '☁️ Online';
         setSt('','');
-        serverRow.classList.remove('error');
-      };
+        if (onReady) { onReady(); onReady = null; }
+      });
 
-      ws.onmessage = e => {
-        let msg;
-        try { msg = JSON.parse(e.data); } catch{ return; }
-        handle(msg);
-      };
-
-      ws.onclose = () => {
+      mqttClient.on('error', (err) => {
         connDot.className = 'err';
-        modeLabel.textContent = 'Disconnected';
-        if (running) setSt('Connection lost — reconnecting…','err');
-        // Auto-reconnect after 2s if game was running or lobby open
-        setTimeout(()=>{
-          if (!running || document.visibilityState !== 'hidden') connectWS();
-        }, 2000);
-      };
+        setSt('Relay error: '+err.message,'err');
+        modeLabel.textContent = 'Offline';
+      });
 
-      ws.onerror = () => {
+      mqttClient.on('offline', () => {
         connDot.className = 'err';
-        setSt('Cannot reach server: '+WS_URL,'err');
-        modeLabel.textContent = 'No server';
-        serverRow.classList.add('error');
-      };
+        modeLabel.textContent = 'Reconnecting…';
+      });
+
+      mqttClient.on('reconnect', () => {
+        setSt('Reconnecting…','');
+        // Re-subscribe after reconnect
+        if (topic) mqttClient.subscribe(topic);
+      });
+
+      mqttClient.on('message', (t, payload) => {
+        try {
+          const msg = JSON.parse(payload.toString());
+          if (msg._from === myId) return; // ignore own messages
+          handle(msg);
+        } catch(e) {}
+      });
     }
 
-    function send(msg) {
-      if (ws && ws.readyState === 1) ws.send(JSON.stringify(msg));
+    function joinMQTTRoom(code) {
+      topic = TOPIC_PREFIX + code;
+      if (mqttClient && mqttClient.connected) {
+        mqttClient.subscribe(topic);
+      } else {
+        connectMQTT(() => mqttClient.subscribe(topic));
+      }
     }
 
-    // Relay = broadcast to all in room (server echoes to everyone else)
     function relay(msg) {
-      msg._room = roomId;
-      send(msg);
+      if (!mqttClient || !mqttClient.connected || !topic) return;
+      msg._from = myId;
+      mqttClient.publish(topic, JSON.stringify(msg), { qos: 0 });
     }
 
-    // Join a relay room on the server
-    function joinRelay(code) {
-      send({ type: '_join', room: code, id: myId });
-    }
-
-    // ── Message handler ──────────────────────────────────────────
+    // ── Message handler ───────────────────────────────────────────
     function handle(msg) {
       switch(msg.type){
-        case '_joined': // server confirms room join
-          if (isHost) {
-            showRoom(true); renderChips();
-            setSt('','');
-          }
-          break;
         case 'join':      if(isHost) peerJoined(msg); break;
         case 'join-ack':  if(msg.to===myId) joinedRoom(msg); break;
-        case 'peer-sync': onPeerSync(msg); break;
         case 'start':     if(!isHost) remoteStart(msg); break;
         case 'state':     if(!isHost) remoteState(msg); break;
         case 'input':     if(isHost) peerInput(msg); break;
@@ -180,21 +147,16 @@
       }
     }
 
-    // ── Lobby ────────────────────────────────────────────────────
+    // ── Lobby ─────────────────────────────────────────────────────
     createBtn.onclick = () => {
-      if (!ws || ws.readyState !== 1) { setSt('Not connected to server — check server URL below','err'); return; }
       myName = ni.value.trim()||'Player';
       roomId = genCode(); isHost = true;
       players = {}; addP(myId, myName, 0);
-      joinRelay(roomId);
-      // Show room immediately (server join is instant)
-      roomCode.textContent = roomId;
-      roomPanel.classList.add('show');
-      actionRow.style.display   = 'none';
-      joinSection.style.display = 'none';
-      startHint.textContent = '1 player in room';
-      setSt('','');
-      renderChips();
+      setSt('Connecting…','');
+      connectMQTT(() => {
+        joinMQTTRoom(roomId);
+        showRoom(true); renderChips();
+      });
     };
 
     soloBtn.onclick = () => {
@@ -208,33 +170,35 @@
     joinBtn.onclick = doJoin;
     ji.addEventListener('keydown', e => { if(e.key==='Enter') doJoin(); });
 
+    // Auto-join from URL param
+    const autoJoin = new URLSearchParams(location.search).get('join');
+    if (autoJoin) { ji.value = autoJoin.toUpperCase(); }
+
     function doJoin() {
-      if (!ws || ws.readyState !== 1) { setSt('Not connected to server — check server URL below','err'); return; }
       const code = ji.value.trim().toUpperCase();
       if(code.length < 3){ setSt('Enter a room code','err'); return; }
       myName = ni.value.trim()||'Player';
       roomId = code; isHost = false;
-      joinRelay(code);
-      setSt('Joining room '+code+'…','');
-      // Announce ourselves after a tick
-      setTimeout(() => {
-        relay({type:'join', id:myId, name:myName, pi:1, fromId:myId});
-        setTimeout(()=>{
-          if(!roomPanel.classList.contains('show'))
-            setSt('No host found for "'+code+'". Check the code.','err');
-        }, 5000);
-      }, 300);
+      setSt('Joining…','');
+      connectMQTT(() => {
+        joinMQTTRoom(code);
+        setTimeout(() => {
+          relay({type:'join', id:myId, name:myName, pi:1});
+          setTimeout(() => {
+            if(!roomPanel.classList.contains('show'))
+              setSt('No host found for "'+code+'". Check the code.','err');
+          }, 5000);
+        }, 300);
+      });
     }
 
     copyBtn.onclick = () => {
-      const code = roomCode.textContent;
-      const full = location.href.split('?')[0]+'?server='+serverInput.value.trim()+'&join='+code;
-      navigator.clipboard.writeText(full).catch(()=>{}).then(()=>{}).finally(()=>{});
-      // fallback
-      try { navigator.clipboard.writeText(full); } catch(e){}
-      // Simple copy
-      const t=document.createElement('input'); t.value=full;
-      document.body.appendChild(t); t.select(); try{document.execCommand('copy');}catch(e){}
+      const base = location.href.split('?')[0];
+      const link = base + '?join=' + roomId;
+      try { navigator.clipboard.writeText(link); } catch(e) {}
+      const t=document.createElement('input'); t.value=link;
+      document.body.appendChild(t); t.select();
+      try{document.execCommand('copy');}catch(e){}
       document.body.removeChild(t);
       copyBtn.textContent='Copied!'; setTimeout(()=>copyBtn.textContent='Copy link',1500);
     };
@@ -247,6 +211,7 @@
 
     leaveBtn.onclick = () => {
       relay({type:'leave', id:myId});
+      if (mqttClient) mqttClient.end();
       location.reload();
     };
 
@@ -256,7 +221,7 @@
       actionRow.style.display   = 'none';
       joinSection.style.display = 'none';
       if(!hosting){ startBtn.style.display='none'; startHint.textContent='Waiting for host to start…'; }
-      else { startHint.textContent='1 player in room'; }
+      else { startHint.textContent='1 player — share the link to invite friends'; }
       setSt('','');
     }
 
@@ -271,16 +236,15 @@
       }
     }
 
-    // ── Peer messages ────────────────────────────────────────────
+    // ── Peer messages ─────────────────────────────────────────────
     function peerJoined(msg) {
       if(!players[msg.id]){
         const idx=Object.keys(players).length%PAL.length;
         addP(msg.id, msg.name, idx);
       }
       renderChips();
-      startHint.textContent = Object.keys(players).length+' player(s) in room';
-      setSt(msg.name+' joined!','ok');
-      setTimeout(()=>setSt('',''), 2000);
+      startHint.textContent = Object.keys(players).length+' player(s) — share the link!';
+      setSt(msg.name+' joined!','ok'); setTimeout(()=>setSt('',''), 2000);
       relay({type:'join-ack', to:msg.id,
              peers:Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi}))});
     }
@@ -291,13 +255,6 @@
       if(!players[myId]) addP(myId, myName, Object.keys(players).length%PAL.length);
       showRoom(false); renderChips(); setSt('Joined!','ok');
       setTimeout(()=>setSt('',''), 2000);
-    }
-
-    function onPeerSync(msg) {
-      if(isHost) return;
-      for(const p of msg.players){ if(!players[p.id]) addP(p.id,p.name,p.pi); }
-      renderChips();
-      setTimeout(()=>relay({type:'join', id:myId, name:myName, pi:1, fromId:myId}), 500);
     }
 
     function peerInput(msg) {
@@ -318,12 +275,12 @@
       if(msg.over) showOver(false);
     }
 
-    // ── Players ──────────────────────────────────────────────────
+    // ── Players ───────────────────────────────────────────────────
     function addP(id,name,pi){ players[id]={id,name,pi:pi%PAL.length,snake:[],dir:{x:1,y:0},nd:{x:1,y:0},alive:true,score:0}; }
     function ser(){ return Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi,snake:p.snake,dir:p.dir,nd:p.nd,alive:p.alive,score:p.score})); }
     function restorePl(list){ for(const p of list){ if(!players[p.id]) players[p.id]={}; Object.assign(players[p.id],p); } }
 
-    // ── Game ─────────────────────────────────────────────────────
+    // ── Game ──────────────────────────────────────────────────────
     function enterGame(){ lobbyWrap.style.display='none'; gameWrap.classList.add('show'); }
 
     function initSnakes(){
@@ -376,7 +333,7 @@
       if(over){ running=false; showOver(true); } else sched();
     }
 
-    // ── HUD & Overlay ────────────────────────────────────────────
+    // ── HUD & Overlay ─────────────────────────────────────────────
     function renderHUD(){
       hudEl.innerHTML=''; const ps=Object.values(players); if(!ps.length) return;
       hudEl.style.width=W+'px';
@@ -414,7 +371,7 @@
       relay({type:'start', players:ser(), foods}); sched();
     };
 
-    // ── Input ────────────────────────────────────────────────────
+    // ── Input ─────────────────────────────────────────────────────
     const DIRS={ArrowUp:{x:0,y:-1},w:{x:0,y:-1},W:{x:0,y:-1},ArrowDown:{x:0,y:1},s:{x:0,y:1},S:{x:0,y:1},ArrowLeft:{x:-1,y:0},a:{x:-1,y:0},A:{x:-1,y:0},ArrowRight:{x:1,y:0},d:{x:1,y:0},D:{x:1,y:0}};
     document.addEventListener('keydown',e=>{
       const d=DIRS[e.key];
@@ -435,7 +392,7 @@
       p.nd=d; if(!isHost) relay({type:'input',id:myId,dir:d}); ts=null;
     },{passive:true});
 
-    // ── Render ───────────────────────────────────────────────────
+    // ── Render ────────────────────────────────────────────────────
     function renderGame(){
       ctx.fillStyle='#0d0d0d'; ctx.fillRect(0,0,W,H);
       ctx.strokeStyle='rgba(255,255,255,0.033)'; ctx.lineWidth=1;
@@ -471,12 +428,8 @@
       for(let y=0;y<=ROWS;y++){ctx.beginPath();ctx.moveTo(0,y*CELL);ctx.lineTo(W,y*CELL);ctx.stroke();}
     })();
 
-    // Handle ?join= param for direct links
-    const autoJoin = new URLSearchParams(location.search).get('join');
-    if (autoJoin) { ji.value = autoJoin.toUpperCase(); }
-
-    // Connect on load
-    connectWS();
+    // Pre-connect to MQTT so Create Room is instant
+    connectMQTT(null);
   });
   </script>
 </head>
@@ -498,9 +451,9 @@
       <span id="room-code">—</span>
       <button id="copy-btn">Copy link</button>
     </div>
-    <div id="room-hint">Share the link — friends open it and join automatically.</div>
+    <div id="room-hint">Share the link — friends open it on any device and join automatically. 🌍</div>
     <div id="players-wrap"></div>
-    <button class="btn cyan" id="start-btn">Start Game</button>
+    <button class="btn cyan" id="start-btn">▶ Start Game</button>
     <div id="start-hint">Waiting for players…</div>
   </div>
   <div id="action-row" class="btn-row">
@@ -516,20 +469,6 @@
     </div>
   </div>
   <div id="status"></div>
-  <details id="server-details">
-    <summary>⚙ Server</summary>
-    <div id="server-row" class="field" style="margin-top:8px">
-      <label>WebSocket server (host:port)</label>
-      <div style="display:flex;gap:8px;margin-top:4px">
-        <input id="server-input" type="text" placeholder="localhost:3000" style="font-family:monospace;font-size:.85rem" />
-        <button id="server-apply" class="btn muted" style="width:auto;padding:8px 14px;white-space:nowrap">Connect</button>
-      </div>
-      <div style="font-size:.72rem;color:var(--dim);margin-top:4px">
-        Default: <code>localhost:3000</code> — start <code>server.js</code> on your machine first.
-        For cross-device on same WiFi use your LAN IP, e.g. <code>192.168.1.x:3000</code>.
-      </div>
-    </div>
-  </details>
 </div>
 
 <div id="game-wrap">
@@ -622,11 +561,6 @@
   #ov-hint { font-size:.8rem; color:var(--dim); }
   #ctrl { margin-top:10px; display:flex; gap:8px; align-items:center; font-size:.78rem; color:var(--dim); flex-wrap:wrap; justify-content:center; }
   .key { display:inline-block; padding:2px 6px; border:1px solid var(--border); border-radius:3px; font-size:.74rem; color:#aaa; background:var(--surface); }
-  #server-details { border-top:1px solid var(--border); padding-top:12px; margin-top:-4px; }
-  #server-details summary { font-size:.8rem; color:var(--dim); cursor:pointer; letter-spacing:.04em; }
-  #server-details summary:hover { color:var(--text); }
-  #server-row.error label { color:var(--pink); }
-  code { font-family:monospace; background:#1a1a1a; padding:1px 5px; border-radius:3px; font-size:.85em; color:var(--cyan); }
 </style>
 </body>
 </html>
