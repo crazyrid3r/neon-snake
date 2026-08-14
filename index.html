@@ -61,8 +61,8 @@
     // Next PU countdown (host only)
     let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
     // Active rooms discovered via MQTT lobby topic
-    let activeRooms={};      // code -> {code,label,players,mode,ts}
-    let announceTimer=null;
+    let activeRooms={};      // code -> {code,label,players,mode,ts,lastSeen}
+    let announceTimer=null, activeRoomsSweepTimer=null;
 
     // ── Highscore (localStorage) ──
     const HS_KEY='mbfs-snake-hs';
@@ -124,14 +124,25 @@
       announceTimer=setInterval(ann,ROOM_ANNOUNCE_INTERVAL);
     }
     function stopAnnouncing(){clearInterval(announceTimer);announceTimer=null;}
+    function startActiveRoomsSweep(){
+      if(activeRoomsSweepTimer)return;
+      activeRoomsSweepTimer=setInterval(()=>{
+        const now=Date.now();
+        let changed=false;
+        for(const [code,room] of Object.entries(activeRooms)){
+          if(now-(room.lastSeen||0)>12000){
+            delete activeRooms[code];
+            changed=true;
+          }
+        }
+        if(changed)renderActiveRooms();
+      },2000);
+    }
 
     function handleLobby(m){
       if(m.type==='room'&&m.code){
-        activeRooms[m.code]={...m};
+        activeRooms[m.code]={...activeRooms[m.code],...m,lastSeen:Date.now()};
         renderActiveRooms();
-        // Expire rooms not heard in 10s
-        clearTimeout(activeRooms[m.code]._exp);
-        activeRooms[m.code]._exp=setTimeout(()=>{delete activeRooms[m.code];renderActiveRooms();},10000);
       }
     }
     function renderActiveRooms(){
@@ -155,6 +166,7 @@
       switch(msg.type){
         case 'join':      if(isHost)peerJoined(msg);break;
         case 'join-ack':  if(msg.to===myId)joinedRoom(msg);break;
+        case 'roster':    if(!isHost)syncRoster(msg);break;
         case 'start':     if(!isHost)remoteStart(msg);break;
         case 'state':     if(!isHost)remoteState(msg);break;
         case 'input':     if(isHost)peerInput(msg);break;
@@ -220,10 +232,41 @@
     }
 
     // Peer messages
-    function peerJoined(msg){if(!players[msg.id])addP(msg.id,msg.name,Object.keys(players).length%PAL.length);renderChips();startHint.textContent=Object.keys(players).length+' player(s)';setSt(msg.name+' joined!','ok');setTimeout(()=>setSt('',''),2000);relay({type:'join-ack',to:msg.id,peers:Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi}))});}
+    function broadcastRoster(){
+      relay({type:'roster',peers:Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi}))});
+    }
+    function peerJoined(msg){
+      if(!players[msg.id])addP(msg.id,msg.name,Object.keys(players).length%PAL.length);
+      renderChips();
+      startHint.textContent=Object.keys(players).length+' player(s)';
+      setSt(msg.name+' joined!','ok');
+      setTimeout(()=>setSt('',''),2000);
+      startAnnouncing();
+      const peers=Object.values(players).map(p=>({id:p.id,name:p.name,pi:p.pi}));
+      relay({type:'join-ack',to:msg.id,peers});
+      broadcastRoster();
+    }
     function joinedRoom(msg){players={};for(const p of msg.peers)addP(p.id,p.name,p.pi);if(!players[myId])addP(myId,myName,Object.keys(players).length%PAL.length);showRoom(false);renderChips();setSt('Joined!','ok');setTimeout(()=>setSt('',''),2000);}
     function peerInput(msg){const p=players[msg.id];if(p&&p.alive)p.nd=msg.dir;}
-    function peerLeft(msg){delete players[msg.id];renderChips();renderHUD();}
+    function syncRoster(msg){
+      if(!msg.peers)return;
+      const prevMe=players[myId];
+      players={};
+      for(const p of msg.peers)addP(p.id,p.name,p.pi);
+      if(!players[myId]&&prevMe)addP(myId,prevMe.name,prevMe.pi);
+      renderChips();
+      renderHUD();
+    }
+    function peerLeft(msg){
+      delete players[msg.id];
+      renderChips();
+      renderHUD();
+      if(isHost){
+        startHint.textContent=Object.keys(players).length+' player(s)';
+        startAnnouncing();
+        broadcastRoster();
+      }
+    }
     function remoteStart(msg){withPowerups=msg.withPowerups!==false;roomLabel=msg.roomLabel||'';restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt||0;nextPUType=msg.nextPUType||null;enterGame();renderGame();renderHUD();overlay.classList.add('hide');running=true;}
     function remoteState(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt;nextPUType=msg.nextPUType;level=msg.level;renderGame();renderHUD();updateCountdown();if(msg.over)showOver(false);}
 
@@ -487,6 +530,7 @@
     (()=>{ctx.fillStyle='#0d0d0d';ctx.fillRect(0,0,W,H);ctx.strokeStyle='rgba(255,255,255,0.033)';ctx.lineWidth=1;for(let x=0;x<=COLS;x++){ctx.beginPath();ctx.moveTo(x*CELL,0);ctx.lineTo(x*CELL,H);ctx.stroke();}for(let y=0;y<=ROWS;y++){ctx.beginPath();ctx.moveTo(0,y*CELL);ctx.lineTo(W,y*CELL);ctx.stroke();}})();
 
     connectMQTT(null);
+    startActiveRoomsSweep();
   });
   </script>
 </head>
