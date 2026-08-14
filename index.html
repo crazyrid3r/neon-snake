@@ -124,7 +124,8 @@
       const inRoom=!!roomId&&roomPanel.classList.contains('show');
       const visibleMessages=inRoom?roomChat:lobbyFeed;
       lobbyChatEl.style.display='flex';
-      chatInput.parentElement.style.display=inRoom?'flex':'none';
+      const composeEl=document.getElementById('chat-compose');
+      if(composeEl)composeEl.style.display=inRoom?'flex':'none';
       chatListEl.innerHTML=visibleMessages.length
         ? visibleMessages.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
         : '<div class="chat-empty">No chat yet.</div>';
@@ -250,7 +251,7 @@
       code=(code||'').trim().toUpperCase();
       if(code.length<3){setSt('Enter a room code','err');return;}
       myName=pickName(ni.value,genPlayerName); ni.value=myName; roomId=code; isHost=false; setSt('Joining…','');
-      roomChat=loadRoomChat(code);
+      roomChat=[];
       renderLobbyChat();
       connectMQTT(()=>{
         joinRoom(code);
@@ -285,7 +286,6 @@
         roomExitBtn.style.display='none';
         startHint.textContent='1 player — waiting for friends to join';
       }
-      roomChat=loadRoomChat(roomId);
       renderLobbyChat();
       setSt('','');
     }
@@ -313,7 +313,7 @@
       relay({type:'join-ack',to:msg.id,peers});
       broadcastRoster();
     }
-    function joinedRoom(msg){players={};for(const p of msg.peers)addP(p.id,p.name,p.pi);if(!players[myId])addP(myId,myName,Object.keys(players).length%PAL.length);showRoom(false);renderChips();setSt('Joined!','ok');setTimeout(()=>setSt('',''),2000);}
+    function joinedRoom(msg){players={};roomChat=[];for(const p of msg.peers)addP(p.id,p.name,p.pi);if(!players[myId])addP(myId,myName,Object.keys(players).length%PAL.length);showRoom(false);renderChips();setSt('Joined!','ok');setTimeout(()=>setSt('',''),2000);}
     function peerInput(msg){const p=players[msg.id];if(p&&p.alive)p.nd=msg.dir;}
     function syncRoster(msg){
       if(!msg.peers)return;
@@ -554,7 +554,18 @@
 
     // Input
     const DIRS={ArrowUp:{x:0,y:-1},w:{x:0,y:-1},W:{x:0,y:-1},ArrowDown:{x:0,y:1},s:{x:0,y:1},S:{x:0,y:1},ArrowLeft:{x:-1,y:0},a:{x:-1,y:0},A:{x:-1,y:0},ArrowRight:{x:1,y:0},d:{x:1,y:0},D:{x:1,y:0}};
-    document.addEventListener('keydown',e=>{const d=DIRS[e.key];if(d){e.preventDefault();pushDir(d);return;}if(e.key==='p'||e.key==='P'){if(!running)return;paused=!paused;if(!paused&&isHost)sched();}});
+    document.addEventListener('keydown',e=>{
+      const target=e.target;
+      const typing=target&&(
+        target.tagName==='INPUT'||
+        target.tagName==='TEXTAREA'||
+        target.isContentEditable
+      );
+      if(typing)return;
+      const d=DIRS[e.key];
+      if(d){e.preventDefault();pushDir(d);return;}
+      if(e.key==='p'||e.key==='P'){if(!running)return;paused=!paused;if(!paused&&isHost)sched();}
+    });
     function pushDir(d){const p=me();if(!p||!p.alive)return;if(d.x===-p.dir.x&&d.y===-p.dir.y)return;p.nd=d;if(!isHost)relay({type:'input',id:myId,dir:d});}
 
     // D-Pad
