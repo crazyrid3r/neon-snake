@@ -33,6 +33,8 @@
 
   const MQTT_BROKER ='wss://broker.hivemq.com:8884/mqtt';
   const TOPIC_PREFIX='mbfs-snake-v2/';
+  const LOBBY_TOPIC='mbfs-snake-v2-lobby';
+  const ROOM_ANNOUNCE_INTERVAL=4000; // ms between room heartbeats
 
   window.addEventListener('DOMContentLoaded',()=>{
     const get=id=>document.getElementById(id);
@@ -44,7 +46,9 @@
           statusEl=get('status'),canvas=get('c'),overlay=get('overlay'),
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
           leaveBtn=get('leave-btn'),connDot=get('conn-dot'),modeLabel=get('mode-label'),
-          hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown');
+          hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown'),
+          roomNameInput=get('room-name-input'),modeSelect=get('mode-select'),
+          activeRoomsEl=get('active-rooms'),highscoreEl=get('highscore-list');
     const ctx=canvas.getContext('2d');
     canvas.width=W; canvas.height=H;
 
@@ -52,9 +56,31 @@
     let mqttClient=null, myId='p'+Math.random().toString(36).slice(2,8),
         myName='', roomId='', topic='', isHost=false,
         players={}, foods=[], powerups=[],
-        running=false, paused=false, loopT=null, level=1, tick=0;
+        running=false, paused=false, loopT=null, level=1, tick=0,
+        withPowerups=true, roomLabel='';
     // Next PU countdown (host only)
     let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
+    // Active rooms discovered via MQTT lobby topic
+    let activeRooms={};      // code -> {code,label,players,mode,ts}
+    let announceTimer=null;
+
+    // ── Highscore (localStorage) ──
+    const HS_KEY='mbfs-snake-hs';
+    function loadHS(){try{return JSON.parse(localStorage.getItem(HS_KEY))||[];}catch{return[];}}
+    function saveHS(name,score){
+      const hs=loadHS();
+      hs.push({name,score,date:new Date().toLocaleDateString()});
+      hs.sort((a,b)=>b.score-a.score);
+      localStorage.setItem(HS_KEY,JSON.stringify(hs.slice(0,10)));
+      renderHighscores();
+    }
+    function renderHighscores(){
+      const hs=loadHS();
+      if(!highscoreEl)return;
+      if(!hs.length){highscoreEl.innerHTML='<span class="hs-empty">No scores yet — play a round!</span>';return;}
+      highscoreEl.innerHTML=hs.map((e,i)=>`<div class="hs-row"><span class="hs-rank">#${i+1}</span><span class="hs-name">${esc(e.name)}</span><span class="hs-score">${e.score}</span><span class="hs-date">${e.date}</span></div>`).join('');
+    }
+    renderHighscores();
 
     function me(){return players[myId];}
     function genCode(){const c='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';return Array.from({length:5},()=>c[Math.floor(Math.random()*c.length)]).join('');}
@@ -66,14 +92,63 @@
       setSt('Connecting…',''); connDot.className='';
       const cid='mbfs-'+Math.random().toString(36).slice(2,10);
       mqttClient=mqtt.connect(MQTT_BROKER,{clientId:cid,keepalive:30,reconnectPeriod:2000,connectTimeout:8000});
-      mqttClient.on('connect',()=>{connDot.className='on';modeLabel.textContent='☁️ Online';setSt('','');if(cb){cb();cb=null;}});
+      mqttClient.on('connect',()=>{
+        connDot.className='on';modeLabel.textContent='☁️ Online';setSt('','');
+        mqttClient.subscribe(LOBBY_TOPIC);
+        if(cb){cb();cb=null;}
+      });
       mqttClient.on('error',()=>{connDot.className='err';modeLabel.textContent='Offline';});
       mqttClient.on('offline',()=>{connDot.className='err';modeLabel.textContent='Reconnecting…';});
-      mqttClient.on('reconnect',()=>{if(topic)mqttClient.subscribe(topic);});
-      mqttClient.on('message',(t,payload)=>{try{const m=JSON.parse(payload.toString());if(m._from===myId)return;handle(m);}catch(e){}});
+      mqttClient.on('reconnect',()=>{if(topic)mqttClient.subscribe(topic);mqttClient.subscribe(LOBBY_TOPIC);});
+      mqttClient.on('message',(t,payload)=>{
+        try{
+          const m=JSON.parse(payload.toString());
+          if(t===LOBBY_TOPIC){handleLobby(m);return;}
+          if(m._from===myId)return;
+          handle(m);
+        }catch(e){}
+      });
     }
     function joinRoom(code){topic=TOPIC_PREFIX+code;if(mqttClient&&mqttClient.connected)mqttClient.subscribe(topic);else connectMQTT(()=>mqttClient.subscribe(topic));}
     function relay(msg){if(!mqttClient||!mqttClient.connected||!topic)return;msg._from=myId;mqttClient.publish(topic,JSON.stringify(msg),{qos:0});}
+
+    // Room announcements on lobby topic
+    function startAnnouncing(){
+      stopAnnouncing();
+      function ann(){
+        if(!mqttClient||!mqttClient.connected)return;
+        const msg={type:'room',code:roomId,label:roomLabel,players:Object.keys(players).length,mode:withPowerups?'powerups':'classic',ts:Date.now()};
+        mqttClient.publish(LOBBY_TOPIC,JSON.stringify(msg),{qos:0});
+      }
+      ann();
+      announceTimer=setInterval(ann,ROOM_ANNOUNCE_INTERVAL);
+    }
+    function stopAnnouncing(){clearInterval(announceTimer);announceTimer=null;}
+
+    function handleLobby(m){
+      if(m.type==='room'&&m.code){
+        activeRooms[m.code]={...m};
+        renderActiveRooms();
+        // Expire rooms not heard in 10s
+        clearTimeout(activeRooms[m.code]._exp);
+        activeRooms[m.code]._exp=setTimeout(()=>{delete activeRooms[m.code];renderActiveRooms();},10000);
+      }
+    }
+    function renderActiveRooms(){
+      const rooms=Object.values(activeRooms);
+      if(!activeRoomsEl)return;
+      const sect=document.getElementById('rooms-section');
+      if(!rooms.length){if(sect)sect.style.display='none';return;}
+      if(sect)sect.style.display='';
+      activeRoomsEl.innerHTML=rooms.map(r=>{
+        const modeTag=r.mode==='powerups'?'⚡':'🐍';
+        return `<button class="room-row" onclick="document.getElementById('ji').value='${esc(r.code)}';document.getElementById('join-btn').click()">
+          <span class="rname">${esc(r.label||r.code)}</span>
+          <span class="rcode">${esc(r.code)}</span>
+          <span class="rinfo">${r.players}P ${modeTag}</span>
+        </button>`;
+      }).join('');
+    }
 
     // Messages
     function handle(msg){
@@ -89,11 +164,18 @@
 
     // Lobby
     createBtn.onclick=()=>{
-      myName=ni.value.trim()||'Player'; roomId=genCode(); isHost=true;
+      myName=ni.value.trim()||'Player';
+      roomLabel=roomNameInput.value.trim()||myName+"'s Room";
+      withPowerups=modeSelect.value==='powerups';
+      roomId=genCode(); isHost=true;
       players={}; addP(myId,myName,0); setSt('Connecting…','');
-      connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();});
+      connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();startAnnouncing();});
     };
-    soloBtn.onclick=()=>{myName=ni.value.trim()||'Player';roomId=genCode();isHost=true;players={};addP(myId,myName,0);enterGame();startGame();modeLabel.textContent='Solo';};
+    soloBtn.onclick=()=>{
+      myName=ni.value.trim()||'Player';
+      withPowerups=modeSelect.value==='powerups';
+      roomId=genCode();isHost=true;players={};addP(myId,myName,0);enterGame();startGame();modeLabel.textContent='Solo';
+    };
     joinBtn.onclick=doJoin;
     ji.addEventListener('keydown',e=>{if(e.key==='Enter')doJoin();});
     const autoJoin=new URLSearchParams(location.search).get('join');
@@ -118,8 +200,8 @@
       try{document.execCommand('copy');}catch(e){}document.body.removeChild(t);
       copyBtn.textContent='Copied!';setTimeout(()=>copyBtn.textContent='Copy link',1500);
     };
-    startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType});};
-    leaveBtn.onclick=()=>{relay({type:'leave',id:myId});if(mqttClient)mqttClient.end();location.reload();};
+    startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType,withPowerups,roomLabel});};
+    leaveBtn.onclick=()=>{relay({type:'leave',id:myId});stopAnnouncing();if(mqttClient)mqttClient.end();location.reload();};
 
     function showRoom(hosting){
       roomCode.textContent=roomId;roomPanel.classList.add('show');
@@ -142,7 +224,7 @@
     function joinedRoom(msg){players={};for(const p of msg.peers)addP(p.id,p.name,p.pi);if(!players[myId])addP(myId,myName,Object.keys(players).length%PAL.length);showRoom(false);renderChips();setSt('Joined!','ok');setTimeout(()=>setSt('',''),2000);}
     function peerInput(msg){const p=players[msg.id];if(p&&p.alive)p.nd=msg.dir;}
     function peerLeft(msg){delete players[msg.id];renderChips();renderHUD();}
-    function remoteStart(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt||0;nextPUType=msg.nextPUType||null;enterGame();renderGame();renderHUD();overlay.classList.add('hide');running=true;}
+    function remoteStart(msg){withPowerups=msg.withPowerups!==false;roomLabel=msg.roomLabel||'';restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt||0;nextPUType=msg.nextPUType||null;enterGame();renderGame();renderHUD();overlay.classList.add('hide');running=true;}
     function remoteState(msg){restorePl(msg.players);foods=msg.foods;powerups=msg.powerups||[];nextPUAt=msg.nextPUAt;nextPUType=msg.nextPUType;level=msg.level;renderGame();renderHUD();updateCountdown();if(msg.over)showOver(false);}
 
     // Players
@@ -185,7 +267,7 @@
 
     function updateCountdown(){
       if(!puCountdownEl)return;
-      if(!running||!nextPUAt||!nextPUType){puCountdownEl.style.display='none';return;}
+      if(!running||!withPowerups||!nextPUAt||!nextPUType){puCountdownEl.style.display='none';return;}
       const def=POWERUPS.find(p=>p.id===nextPUType);
       const rem=Math.max(0,Math.ceil((nextPUAt-Date.now())/1000));
       if(rem<=0){puCountdownEl.style.display='none';return;}
@@ -250,7 +332,7 @@
     function startGame(){
       foods=[];powerups=[];initSnakes();placeFood(Math.max(1,Object.keys(players).length));
       level=1;tick=0;running=true;paused=false;overlay.classList.add('hide');renderHUD();
-      if(isHost)scheduleNextPU();
+      if(isHost&&withPowerups)scheduleNextPU();
       sched();
       // Start countdown UI updater
       setInterval(updateCountdown,500);
@@ -325,6 +407,9 @@
     }
     function showOver(iAmHost){
       const ps=Object.values(players).sort((a,b)=>b.score-a.score);
+      // Save highscore for local player
+      const me_=ps.find(p=>p.id===myId);
+      if(me_&&me_.score>0)saveHS(me_.name,me_.score);
       ovTitle.textContent=ps.length>1?'Round Over':'Game Over';
       ovTitle.style.color='#ff2d78';ovTitle.style.textShadow='0 0 16px #ff2d78';
       ovScores.innerHTML='';
@@ -337,8 +422,8 @@
       if(!isHost)return;
       initSnakes();foods=[];powerups=[];placeFood(Math.max(1,Object.keys(players).length));
       level=1;tick=0;running=true;overlay.classList.add('hide');renderHUD();
-      scheduleNextPU();
-      relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType});sched();
+      if(withPowerups)scheduleNextPU();
+      relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType,withPowerups,roomLabel});sched();
     };
 
     // Input
@@ -415,6 +500,22 @@
     <label for="ni">Your name</label>
     <input id="ni" type="text" maxlength="16" placeholder="Player" autocomplete="off" />
   </div>
+
+  <!-- Create options (hidden until create-row is clicked) -->
+  <div id="create-options">
+    <div class="field">
+      <label for="room-name-input">Room name</label>
+      <input id="room-name-input" type="text" maxlength="24" placeholder="e.g. Friday Night Snake" autocomplete="off" />
+    </div>
+    <div class="field">
+      <label for="mode-select">Game mode</label>
+      <select id="mode-select">
+        <option value="powerups">⚡ With Power-Ups</option>
+        <option value="classic">🐍 Classic (no Power-Ups)</option>
+      </select>
+    </div>
+  </div>
+
   <div id="room-panel">
     <div class="code-box"><span id="room-code">—</span><button id="copy-btn">Copy link</button></div>
     <div id="room-hint">Share the link — friends join on any device. 🌍</div>
@@ -434,6 +535,13 @@
     </div>
   </div>
   <div id="status"></div>
+
+  <!-- Active rooms -->
+  <div id="rooms-section" style="display:none">
+    <div class="section-title">🟢 Active Rooms</div>
+    <div id="active-rooms"></div>
+  </div>
+
   <div class="pu-legend">
     <div class="legend-title">Power-Ups (10s · spawn alle ~13s · weg nach 7s)</div>
     <div class="legend-grid">
@@ -445,6 +553,12 @@
       <span><b style="color:#fff">👻</b> Ghost Mode</span>
       <span><b style="color:#ff7b00">🔀</b> Pos. Swap</span>
     </div>
+  </div>
+
+  <!-- Highscore -->
+  <div class="hs-section">
+    <div class="section-title">🏆 Highscores</div>
+    <div id="highscore-list"></div>
   </div>
 </div>
 
@@ -546,6 +660,28 @@ canvas{display:block;}
 .key{display:inline-block;padding:2px 6px;border:1px solid var(--border);border-radius:3px;font-size:.74rem;color:#aaa;background:var(--surface);}
 .pu-banner{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-60px);background:#111;border:1.5px solid;border-radius:8px;padding:8px 20px;font-size:.9rem;font-weight:700;letter-spacing:.04em;z-index:100;opacity:0;transition:transform .3s,opacity .3s;white-space:nowrap;pointer-events:none;}
 .pu-banner.show{opacity:1;transform:translateX(-50%) translateY(0);}
+/* Select */
+select{width:100%;padding:9px 11px;background:#1e1e1e;border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:.88rem;outline:none;cursor:pointer;transition:border-color .15s;appearance:none;}
+select:focus{border-color:var(--cyan);}
+/* Active rooms */
+.section-title{font-size:.75rem;font-weight:700;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;}
+#active-rooms{display:flex;flex-direction:column;gap:5px;}
+.room-row{background:#111;border:1px solid var(--border);border-radius:5px;padding:8px 12px;display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.82rem;color:var(--text);text-align:left;transition:border-color .15s,background .15s;width:100%;}
+.room-row:hover{border-color:var(--cyan);background:#0d1a1a;color:var(--cyan);}
+.room-row .rname{flex:1;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.room-row .rcode{font-family:monospace;font-size:.78rem;color:var(--dim);letter-spacing:.1em;}
+.room-row .rinfo{font-size:.74rem;color:#555;white-space:nowrap;}
+/* Highscore */
+.hs-section{border-top:1px solid var(--border);padding-top:12px;margin-top:-4px;}
+#highscore-list{display:flex;flex-direction:column;gap:3px;max-height:180px;overflow-y:auto;}
+.hs-row{display:grid;grid-template-columns:2ch 1fr auto auto;gap:6px;align-items:center;font-size:.79rem;padding:3px 0;border-bottom:1px solid #1a1a1a;}
+.hs-rank{color:var(--dim);font-size:.72rem;}
+.hs-name{color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.hs-score{font-weight:800;color:var(--cyan);font-family:monospace;text-shadow:0 0 6px rgba(0,245,255,.4);}
+.hs-date{font-size:.68rem;color:#444;white-space:nowrap;}
+.hs-empty{font-size:.78rem;color:var(--dim);}
+/* Create options */
+#create-options{display:flex;flex-direction:column;gap:12px;}
 </style>
 </body>
 </html>
