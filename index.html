@@ -47,7 +47,8 @@
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
           leaveBtn=get('leave-btn'),connDot=get('conn-dot'),modeLabel=get('mode-label'),
           hudEl=get('hud'),dpadEl=get('dpad'),puCountdownEl=get('pu-countdown'),
-          roomNameInput=get('room-name-input'),modeSelect=get('mode-select'),
+          roomNameInput=get('room-name-input'),
+          modeClassicBtn=get('mode-classic'),modePowerupsBtn=get('mode-powerups'),
           activeRoomsEl=get('active-rooms'),highscoreEl=get('highscore-list');
     const ctx=canvas.getContext('2d');
     canvas.width=W; canvas.height=H;
@@ -57,7 +58,7 @@
         myName='', roomId='', topic='', isHost=false,
         players={}, foods=[], powerups=[],
         running=false, paused=false, loopT=null, level=1, tick=0,
-        withPowerups=true, roomLabel='';
+        withPowerups=false, roomLabel='';
     // Next PU countdown (host only)
     let nextPUAt=0, nextPUType=null, puCountdownTimer=null;
     // Active rooms discovered via MQTT lobby topic
@@ -65,7 +66,18 @@
     let announceTimer=null, activeRoomsSweepTimer=null;
 
     // ── Highscore (localStorage) ──
-    const HS_KEY='mbfs-snake-hs';
+    const HS_KEY='mbfs-neon-snake-highscores-v1';
+    const HS_OLD_KEYS=['mbfs-snake-hs'];
+    function migrateHS(){
+      if(localStorage.getItem(HS_KEY))return;
+      for(const key of HS_OLD_KEYS){
+        const val=localStorage.getItem(key);
+        if(val){
+          localStorage.setItem(HS_KEY,val);
+          break;
+        }
+      }
+    }
     function loadHS(){try{return JSON.parse(localStorage.getItem(HS_KEY))||[];}catch{return[];}}
     function saveHS(name,score){
       const hs=loadHS();
@@ -73,6 +85,20 @@
       hs.sort((a,b)=>b.score-a.score);
       localStorage.setItem(HS_KEY,JSON.stringify(hs.slice(0,10)));
       renderHighscores();
+    }
+
+    const PLAYER_PREFIXES=['Neon','Turbo','Pixel','Ghost','Laser','Nova','Cobra','Viper','Hyper','Shadow'];
+    const PLAYER_SUFFIXES=['Rider','Byte','Spark','Dash','Glide','Flux','Wave','Strike','Drift','Pulse'];
+    const ROOM_PREFIXES=['Neon','Turbo','Pixel','Ghost','Laser','Nova','Midnight','Hyper','Shadow','Electric'];
+    const ROOM_SUFFIXES=['Arena','Pit','Circuit','Grid','Dome','Zone','Room','Run','Club','Battle'];
+    function rnd(arr){return arr[Math.floor(Math.random()*arr.length)];}
+    function genPlayerName(){return `${rnd(PLAYER_PREFIXES)} ${rnd(PLAYER_SUFFIXES)}`;}
+    function genRoomName(){return `${rnd(ROOM_PREFIXES)} ${rnd(ROOM_SUFFIXES)}`;}
+    function pickName(v,fallbackFn){const s=(v||'').trim();return s||fallbackFn();}
+    function setMode(powerups){
+      withPowerups=!!powerups;
+      modeClassicBtn.classList.toggle('active',!withPowerups);
+      modePowerupsBtn.classList.toggle('active',withPowerups);
     }
     function renderHighscores(){
       const hs=loadHS();
@@ -117,7 +143,7 @@
       stopAnnouncing();
       function ann(){
         if(!mqttClient||!mqttClient.connected)return;
-        const msg={type:'room',code:roomId,label:roomLabel,players:Object.keys(players).length,mode:withPowerups?'powerups':'classic',ts:Date.now()};
+        const msg={type:'room',code:roomId,label:roomLabel,players:Object.keys(players).length,mode:withPowerups===true?'powerups':'classic',ts:Date.now()};
         mqttClient.publish(LOBBY_TOPIC,JSON.stringify(msg),{qos:0});
       }
       ann();
@@ -176,16 +202,19 @@
 
     // Lobby
     createBtn.onclick=()=>{
-      myName=ni.value.trim()||'Player';
-      roomLabel=roomNameInput.value.trim()||myName+"'s Room";
-      withPowerups=modeSelect.value==='powerups';
+      setMode(withPowerups);
+      myName=pickName(ni.value,genPlayerName);
+      ni.value=myName;
+      roomLabel=pickName(roomNameInput.value,genRoomName);
+      roomNameInput.value=roomLabel;
       roomId=genCode(); isHost=true;
       players={}; addP(myId,myName,0); setSt('Connecting…','');
       connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();startAnnouncing();});
     };
     soloBtn.onclick=()=>{
-      myName=ni.value.trim()||'Player';
-      withPowerups=modeSelect.value==='powerups';
+      setMode(withPowerups);
+      myName=pickName(ni.value,genPlayerName);
+      ni.value=myName;
       roomId=genCode();isHost=true;players={};addP(myId,myName,0);enterGame();startGame();modeLabel.textContent='Solo';
     };
     joinBtn.onclick=doJoin;
@@ -196,7 +225,7 @@
     function doJoin(){
       const code=ji.value.trim().toUpperCase();
       if(code.length<3){setSt('Enter a room code','err');return;}
-      myName=ni.value.trim()||'Player'; roomId=code; isHost=false; setSt('Joining…','');
+      myName=pickName(ni.value,genPlayerName); ni.value=myName; roomId=code; isHost=false; setSt('Joining…','');
       connectMQTT(()=>{
         joinRoom(code);
         setTimeout(()=>{
@@ -205,6 +234,9 @@
         },300);
       });
     }
+    modeClassicBtn.onclick=()=>setMode(false);
+    modePowerupsBtn.onclick=()=>setMode(true);
+    setMode(false);
     copyBtn.onclick=()=>{
       const link=location.href.split('?')[0]+'?join='+roomId;
       try{navigator.clipboard.writeText(link);}catch(e){}
@@ -552,11 +584,11 @@
       <input id="room-name-input" type="text" maxlength="24" placeholder="e.g. Friday Night Snake" autocomplete="off" />
     </div>
     <div class="field">
-      <label for="mode-select">Game mode</label>
-      <select id="mode-select">
-        <option value="powerups">⚡ With Power-Ups</option>
-        <option value="classic">🐍 Classic (no Power-Ups)</option>
-      </select>
+      <label>Game mode</label>
+      <div class="mode-toggle">
+        <button type="button" class="mode-btn active" id="mode-classic">🐍 Classic</button>
+        <button type="button" class="mode-btn" id="mode-powerups">⚡ Power-Ups</button>
+      </div>
     </div>
   </div>
 
@@ -705,8 +737,10 @@ canvas{display:block;}
 .pu-banner{position:fixed;top:18px;left:50%;transform:translateX(-50%) translateY(-60px);background:#111;border:1.5px solid;border-radius:8px;padding:8px 20px;font-size:.9rem;font-weight:700;letter-spacing:.04em;z-index:100;opacity:0;transition:transform .3s,opacity .3s;white-space:nowrap;pointer-events:none;}
 .pu-banner.show{opacity:1;transform:translateX(-50%) translateY(0);}
 /* Select */
-select{width:100%;padding:9px 11px;background:#1e1e1e;border:1px solid var(--border);color:var(--text);border-radius:4px;font-size:.88rem;outline:none;cursor:pointer;transition:border-color .15s;appearance:none;}
-select:focus{border-color:var(--cyan);}
+.mode-toggle{display:flex;gap:10px;}
+.mode-btn{flex:1;padding:10px 12px;border-radius:4px;border:1.5px solid var(--border);background:#111;color:var(--dim);font-size:.84rem;font-weight:700;letter-spacing:.05em;cursor:pointer;transition:border-color .15s,color .15s,background .15s,box-shadow .15s;}
+.mode-btn:hover{color:var(--text);border-color:#444;}
+.mode-btn.active{border-color:var(--cyan);color:var(--cyan);background:#0d1a1a;box-shadow:0 0 14px rgba(0,245,255,.18);}
 /* Active rooms */
 .section-title{font-size:.75rem;font-weight:700;color:var(--dim);letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;}
 #active-rooms{display:flex;flex-direction:column;gap:5px;}
