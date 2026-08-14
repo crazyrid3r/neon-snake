@@ -124,6 +124,7 @@
       const inRoom=!!roomId&&roomPanel.classList.contains('show');
       const visibleMessages=inRoom?roomChat:lobbyFeed;
       lobbyChatEl.style.display='flex';
+      chatInput.parentElement.style.display=inRoom?'flex':'none';
       chatListEl.innerHTML=visibleMessages.length
         ? visibleMessages.map(m=>`<div class="chat-row"><span class="chat-room">${esc(m.room||roomLabel||roomId)}</span> <span class="chat-user">(${esc(m.user)})</span> <span class="chat-msg">"${esc(m.text)}"</span></div>`).join('')
         : '<div class="chat-empty">No chat yet.</div>';
@@ -132,7 +133,7 @@
       chatSendBtn.disabled=!canWrite;
       chatHintEl.textContent=inRoom
         ? (canWrite?'Write a message for this room.':'Read-only until you join this room with a name.')
-        : 'Global live feed from all active rooms.';
+        : 'Global live feed from all active rooms. Read-only here.';
       chatListEl.scrollTop=chatListEl.scrollHeight;
     }
     renderHighscores();
