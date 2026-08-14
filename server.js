@@ -134,26 +134,20 @@ function handleMessage(clientId, msg) {
   if (!c) return;
 
   switch (msg.type) {
-    case 'join': {
+    case '_join': {
+      // Internal: client joins a relay room
       c.roomId   = msg.room;
       c.playerId = msg.id;
-      // relay to everyone else in room
-      broadcastRoom(msg.room, msg, clientId);
-      // also tell this client about existing members
-      const peers = [];
-      for (const [oid, oc] of clients) {
-        if (oc.roomId === msg.room && oid !== clientId && oc.playerId) {
-          peers.push(oc.playerId);
-        }
-      }
-      send(clientId, { type: 'room-peers', peers });
+      send(clientId, { type: '_joined', room: msg.room });
       break;
     }
+    case 'join':
     case 'join-ack':
     case 'start':
     case 'state':
     case 'input':
     case 'restart':
+    case 'peer-sync':
     case 'ping':
     case 'pong': {
       // relay to room (or specific target)
