@@ -39,9 +39,9 @@
   window.addEventListener('DOMContentLoaded',()=>{
     const get=id=>document.getElementById(id);
     const lobbyWrap=get('lobby-wrap'),gameWrap=get('game-wrap'),
-          ni=get('ni'),ji=get('ji'),createBtn=get('create-btn'),
-          joinBtn=get('join-btn'),actionRow=get('action-row'),joinSection=get('join-section'),
-          roomPanel=get('room-panel'),roomCode=get('room-code'),copyBtn=get('copy-btn'),
+          ni=get('ni'),createBtn=get('create-btn'),
+          actionRow=get('action-row'),
+          roomPanel=get('room-panel'),
           startBtn=get('start-btn'),startHint=get('start-hint'),playersWrap=get('players-wrap'),
           statusEl=get('status'),canvas=get('c'),overlay=get('overlay'),
           ovTitle=get('ov-title'),ovScores=get('ov-scores'),ovHint=get('ov-hint'),ovBtn=get('ov-btn'),
@@ -180,7 +180,7 @@
       if(sect)sect.style.display='';
       activeRoomsEl.innerHTML=rooms.map(r=>{
         const modeTag=r.mode==='powerups'?'⚡':'🐍';
-        return `<button class="room-row" onclick="document.getElementById('ji').value='${esc(r.code)}';document.getElementById('join-btn').click()">
+        return `<button class="room-row" onclick="window.joinActiveRoom('${esc(r.code)}')">
           <span class="rname">${esc(r.label||r.code)}</span>
           <span class="rcode">${esc(r.code)}</span>
           <span class="rinfo">${r.players}P ${modeTag}</span>
@@ -212,13 +212,11 @@
       players={}; addP(myId,myName,0); setSt('Connecting…','');
       connectMQTT(()=>{joinRoom(roomId);showRoom(true);renderChips();startAnnouncing();});
     };
-    joinBtn.onclick=doJoin;
-    ji.addEventListener('keydown',e=>{if(e.key==='Enter')doJoin();});
     const autoJoin=new URLSearchParams(location.search).get('join');
-    if(autoJoin)ji.value=autoJoin.toUpperCase();
+    if(autoJoin)doJoin(autoJoin.toUpperCase());
 
-    function doJoin(){
-      const code=ji.value.trim().toUpperCase();
+    function doJoin(code){
+      code=(code||'').trim().toUpperCase();
       if(code.length<3){setSt('Enter a room code','err');return;}
       myName=pickName(ni.value,genPlayerName); ni.value=myName; roomId=code; isHost=false; setSt('Joining…','');
       connectMQTT(()=>{
@@ -229,24 +227,18 @@
         },300);
       });
     }
+    window.joinActiveRoom=doJoin;
     modeClassicBtn.onclick=()=>setMode(false);
     modePowerupsBtn.onclick=()=>setMode(true);
     setMode(false);
-    copyBtn.onclick=()=>{
-      const link=location.href.split('?')[0]+'?join='+roomId;
-      try{navigator.clipboard.writeText(link);}catch(e){}
-      const t=document.createElement('input');t.value=link;document.body.appendChild(t);t.select();
-      try{document.execCommand('copy');}catch(e){}document.body.removeChild(t);
-      copyBtn.textContent='Copied!';setTimeout(()=>copyBtn.textContent='Copy link',1500);
-    };
     startBtn.onclick=()=>{if(!isHost)return;enterGame();startGame();relay({type:'start',players:ser(),foods,powerups,nextPUAt,nextPUType,withPowerups,roomLabel});};
     leaveBtn.onclick=()=>{relay({type:'leave',id:myId});stopAnnouncing();if(mqttClient)mqttClient.end();location.reload();};
 
     function showRoom(hosting){
-      roomCode.textContent=roomId;roomPanel.classList.add('show');
-      actionRow.style.display='none';joinSection.style.display='none';
+      roomPanel.classList.add('show');
+      actionRow.style.display='none';
       if(!hosting){startBtn.style.display='none';startHint.textContent='Waiting for host…';}
-      else startHint.textContent='1 player — share link to invite friends';
+      else startHint.textContent='1 player — waiting for friends to join';
       setSt('','');
     }
     function renderChips(){
@@ -588,21 +580,12 @@
   </div>
 
   <div id="room-panel">
-    <div class="code-box"><span id="room-code">—</span><button id="copy-btn">Copy link</button></div>
-    <div id="room-hint">Share the link — friends join on any device. 🌍</div>
     <div id="players-wrap"></div>
     <button class="btn cyan" id="start-btn">▶ Start Game</button>
     <div id="start-hint">Waiting for players…</div>
   </div>
   <div id="action-row" class="btn-row">
     <button class="btn cyan" id="create-btn">Create Room</button>
-  </div>
-  <div id="join-section">
-    <div class="field" style="margin-bottom:8px"><label for="ji">Join existing room</label></div>
-    <div id="join-row">
-      <input id="ji" type="text" maxlength="8" placeholder="Room code" style="text-transform:uppercase;letter-spacing:.12em" autocomplete="off" />
-      <button class="btn muted" id="join-btn">Join</button>
-    </div>
   </div>
   <div id="status"></div>
 
@@ -679,17 +662,9 @@ input[type=text]:focus{border-color:var(--cyan);}
 #status.ok{color:var(--green);}#status.err{color:var(--pink);}
 #room-panel{display:none;flex-direction:column;gap:12px;}
 #room-panel.show{display:flex;}
-.code-box{display:flex;align-items:center;gap:10px;background:#111;border:1px solid var(--border);border-radius:5px;padding:10px 14px;}
-#room-code{font-family:monospace;font-size:1.4rem;font-weight:800;color:var(--cyan);letter-spacing:.2em;flex:1;text-shadow:0 0 10px rgba(0,245,255,.4);}
-#copy-btn{padding:4px 10px;font-size:.72rem;border-radius:3px;cursor:pointer;border:1px solid var(--border);background:var(--surface);color:var(--dim);white-space:nowrap;transition:color .1s;}
-#copy-btn:hover{color:var(--text);}
-#room-hint{font-size:.78rem;color:var(--dim);line-height:1.6;}
 #players-wrap{display:flex;flex-wrap:wrap;gap:6px;min-height:26px;}
 .chip{padding:3px 12px;border-radius:20px;font-size:.78rem;font-weight:600;letter-spacing:.04em;border:1.5px solid;}
 #start-hint{font-size:.78rem;color:var(--dim);text-align:center;}
-#join-row{display:flex;gap:8px;}
-#join-row input{flex:1;}
-#join-row .btn{width:auto;padding:9px 16px;}
 .pu-legend{border-top:1px solid var(--border);padding-top:12px;margin-top:-4px;}
 .legend-title{font-size:.72rem;color:var(--dim);margin-bottom:6px;letter-spacing:.05em;}
 .legend-grid{display:grid;grid-template-columns:1fr 1fr;gap:4px 16px;font-size:.79rem;color:#888;}
